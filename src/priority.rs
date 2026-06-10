@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn concurrent_priority_steal_no_loss() {
         let w = PriorityWorker::<usize, 4>::new();
-        let n = 100_000;
+        let n = if cfg!(miri) { 400 } else { 100_000 };
         let thieves = 4;
         let seen: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());

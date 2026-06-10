@@ -40,13 +40,13 @@ use std::boxed::Box;
 #[cfg(not(loom))]
 use std::sync::Arc;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::vec::Vec;
 
 #[cfg(loom)]
 use loom::sync::Arc;
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering, fence};
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::CachePadded;
 pub use crate::Steal;
@@ -110,7 +110,7 @@ fn from_bits<T: Copy>(bits: u64) -> T {
 struct Block {
     /// Inline value bits. Written by the owner (under `committed`), read by owner pops and by
     /// thieves (under the `stolen` CAS). `Copy`, so a racing read is a harmless bit copy.
-    slots: Box<[u64]>,
+    slots: Box<[AtomicU64]>,
     /// Number of entries the owner has *committed* (filled) in this block. Owner-only writes;
     /// published with `Release` so a thief that reads it sees the slot data.
     committed: CachePadded<AtomicUsize>,
@@ -122,7 +122,7 @@ struct Block {
 impl Block {
     fn new(block_size: usize) -> Self {
         Block {
-            slots: vec![0u64; block_size].into_boxed_slice(),
+            slots: (0..block_size).map(|_| AtomicU64::new(0)).collect(),
             committed: CachePadded(AtomicUsize::new(0)),
             stolen: CachePadded(AtomicUsize::new(0)),
         }
@@ -372,22 +372,18 @@ impl Block {
     /// Owner-only slot write. SAFETY: `pos < block_size`; owner is the unique writer.
     #[inline]
     fn slots_write(&self, pos: usize, bits: u64) {
-        // The slots are `Copy` bits; a concurrent thief read of a *different* committed slot can't
-        // race this, and a thief never reads `pos` until `committed` is published (Release) past
-        // it. We use a raw cell write via UnsafeCell semantics emulated over the boxed slice.
-        // SAFETY: single owner writer; thieves only read indices `< committed`.
-        unsafe {
-            let ptr = self.slots.as_ptr().add(pos) as *mut u64;
-            ptr.write(bits);
-        }
+        // Atomic store through a shared `&` is sound (no provenance/aliasing UB): the slot is an
+        // `AtomicU64`. Relaxed is enough — the `committed` Release store published in `put`
+        // orders this write before any thief's Acquire-load of `committed` reaches this index.
+        self.slots[pos].store(bits, Ordering::Relaxed);
     }
 
     /// Slot read (owner or thief). SAFETY: `pos` is `< committed`, which was published Release.
     #[inline]
     fn slots_read(&self, pos: usize) -> u64 {
-        // SAFETY: read of a `Copy` value previously published before `committed` advanced past
-        // `pos`; the value is stable once committed (slots are written once per bounded use).
-        unsafe { self.slots.as_ptr().add(pos).read() }
+        // Atomic load through `&`; paired with the `committed` Release/Acquire handshake that
+        // gates which indices are readable. Relaxed suffices for the value itself.
+        self.slots[pos].load(Ordering::Relaxed)
     }
 }
 
@@ -449,7 +445,8 @@ mod tests {
     fn concurrent_owner_and_thieves_no_loss() {
         let w = BwosWorker::<usize>::with_blocks(64, 256); // capacity 16384
         let thieves = 3;
-        let n = 16_000usize;
+        // Scale down under Miri (it interprets every instruction; 16k items would run for hours).
+        let n = if cfg!(miri) { 400usize } else { 16_000usize };
         let seen: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
 
@@ -559,12 +556,12 @@ pub mod unbounded {
     #[cfg(not(loom))]
     use std::sync::Arc;
     #[cfg(not(loom))]
-    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
     #[cfg(loom)]
     use loom::sync::Arc;
     #[cfg(loom)]
-    use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+    use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
     use super::{from_bits, to_bits};
     use crate::CachePadded;
@@ -584,7 +581,7 @@ pub mod unbounded {
     struct Block {
         /// Inline value bits. Written by the owner (under `committed`), read by owner pops and by
         /// thieves (under the `stolen` CAS). `Copy`, so a racing read is a harmless bit copy.
-        slots: Box<[u64]>,
+        slots: Box<[AtomicU64]>,
         /// Number of entries the owner has *committed* (filled) in this block — the block's *bottom*
         /// in a per-block Chase-Lev protocol. Owner-only writes; published with `Release`.
         committed: CachePadded<AtomicUsize>,
@@ -602,7 +599,7 @@ pub mod unbounded {
     impl Block {
         fn alloc(block_size: usize, prev: *mut Block) -> *mut Block {
             Box::into_raw(Box::new(Block {
-                slots: vec![0u64; block_size].into_boxed_slice(),
+                slots: (0..block_size).map(|_| AtomicU64::new(0)).collect(),
                 committed: CachePadded(AtomicUsize::new(0)),
                 stolen: CachePadded(AtomicUsize::new(0)),
                 next: AtomicPtr::new(core::ptr::null_mut()),
@@ -870,22 +867,17 @@ pub mod unbounded {
         /// Owner-only slot write. SAFETY: `pos < block_size`; owner is the unique writer.
         #[inline]
         fn slots_write(&self, pos: usize, bits: u64) {
-            // The slots are `Copy` bits; a concurrent thief read of a *different* committed slot can't
-            // race this, and a thief never reads `pos` until `committed` is published (Release) past
-            // it. We use a raw cell write via UnsafeCell semantics emulated over the boxed slice.
-            // SAFETY: single owner writer; thieves only read indices `< committed`.
-            unsafe {
-                let ptr = self.slots.as_ptr().add(pos) as *mut u64;
-                ptr.write(bits);
-            }
+            // Atomic store through a shared `&` (the slot is an `AtomicU64`), so no
+            // provenance/aliasing UB. Relaxed: the `committed` Release in `put` orders this write
+            // before any thief's Acquire-load of `committed` reaches this index.
+            self.slots[pos].store(bits, Ordering::Relaxed);
         }
 
         /// Slot read (owner or thief). SAFETY: `pos` is `< committed`, which was published Release.
         #[inline]
         fn slots_read(&self, pos: usize) -> u64 {
-            // SAFETY: read of a `Copy` value previously published before `committed` advanced past
-            // `pos`; the value is stable once committed (slots are written once per bounded use).
-            unsafe { self.slots.as_ptr().add(pos).read() }
+            // Atomic load through `&`, gated by the `committed` Release/Acquire handshake.
+            self.slots[pos].load(Ordering::Relaxed)
         }
     }
 
@@ -902,7 +894,7 @@ pub mod unbounded {
             // Tiny blocks (size 2), 10_000 items: the queue allocates ~5000 fresh blocks on demand
             // (it is unbounded; the bounded `BwosWorker` would reject) and returns all in LIFO order.
             let w = UnboundedBwosWorker::<u64>::with_block_size(2);
-            let n = 10_000u64;
+            let n = if cfg!(miri) { 300u64 } else { 10_000u64 };
             for i in 0..n {
                 assert!(w.put(i), "unbounded put always succeeds (item {i})");
             }
@@ -927,7 +919,7 @@ pub mod unbounded {
         fn unbounded_concurrent_owner_and_thieves_no_loss() {
             let w = UnboundedBwosWorker::<usize>::with_block_size(256);
             let thieves = 3;
-            let n = 16_000usize;
+            let n = if cfg!(miri) { 400usize } else { 16_000usize };
             let seen: StdArc<Vec<AtomicUsize>> =
                 StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
             for i in 0..n {

@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn concurrent_multiplicity_bounded() {
         let mut w = IdempotentWorker::<usize>::new();
-        let n = 100_000;
+        let n = if cfg!(miri) { 400 } else { 100_000 };
         let thieves = 4;
         for i in 0..n {
             w.put(i);
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn bounded_steal_no_two_thieves_same_task() {
         // With steal_exclusive and NO owner take, every task is taken by at most one thief.
-        let n = 100_000;
+        let n = if cfg!(miri) { 400 } else { 100_000 };
         let thieves = 6;
         let mut w = IdempotentWorker::<usize>::bounded(n);
         for i in 0..n {
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn weak_steal_concurrent_at_least_once_bounded() {
         let mut w = IdempotentWorker::<usize>::new();
-        let n = 100_000;
+        let n = if cfg!(miri) { 400 } else { 100_000 };
         let thieves = 4;
         for i in 0..n {
             w.put(i);

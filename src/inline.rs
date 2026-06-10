@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn concurrent_steal_no_loss_inline() {
         let w = InlineWorker::<usize>::new();
-        let n = 200_000usize;
+        let n = if cfg!(miri) { 400usize } else { 200_000usize };
         let thieves = 4;
         let seen: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());

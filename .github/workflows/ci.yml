@@ -71,6 +71,37 @@ jobs:
             -Zbuild-std \
             --target x86_64-unknown-linux-gnu
 
+  # Miri: detects undefined behaviour TSan can't — invalid pointer provenance, misaligned
+  # accesses, reads of uninitialized memory, and (with the flags below) data races and leaks in
+  # the unsafe `AtomicPtr`/raw-pointer code. CI installs a clean, version-matched Miri via rustup
+  # each run, so it is unaffected by any local toolchain breakage.
+  miri:
+    name: Miri (UB detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Miri
+        run: cargo miri setup
+      - name: Run unit tests under Miri
+        # -Zmiri-ignore-leaks: the scheduler/stress tests intentionally leave threads running at
+        #   scope exit; we assert no UB, not zero leaks here.
+        # -Zmiri-disable-isolation: allows time/thread APIs the tests use.
+        env:
+          MIRIFLAGS: "-Zmiri-ignore-leaks -Zmiri-disable-isolation"
+        run: cargo miri test --lib
+      - name: Run ported crossbeam suites under Miri
+        env:
+          MIRIFLAGS: "-Zmiri-ignore-leaks -Zmiri-disable-isolation"
+        # The stress tests scale themselves down under `cfg!(miri)` so they finish in CI time.
+        run: |
+          cargo miri test \
+            --test crossbeam_lifo --test crossbeam_fifo --test crossbeam_steal
+
   # Minimum-supported-Rust-version build (no -D warnings, just must compile).
   msrv:
     name: MSRV (1.73)

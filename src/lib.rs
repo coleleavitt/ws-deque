@@ -820,7 +820,7 @@ mod tests {
         // every value must be consumed exactly once.
         let w = Worker::<usize>::with_log_capacity(1);
         let s = w.stealer();
-        let n = 200_000usize;
+        let n = if cfg!(miri) { 400usize } else { 200_000usize };
         let seen: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let consumed = StdArc::new(AtomicUsize::new(0));
@@ -878,7 +878,7 @@ mod tests {
     fn fifo_concurrent_no_loss() {
         let w = Worker::<usize>::new_fifo();
         let s = w.stealer();
-        let n = 100_000usize;
+        let n = if cfg!(miri) { 400usize } else { 100_000usize };
         let seen: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let consumed = StdArc::new(AtomicUsize::new(0));
@@ -949,7 +949,7 @@ mod tests {
         // Run the standard concurrent stress but starting near the wrap boundary.
         let w = Worker::<usize>::with_start_index(5, isize::MAX - 64);
         let s = w.stealer();
-        let n = 50_000usize;
+        let n = if cfg!(miri) { 300usize } else { 50_000usize };
         let taken: StdArc<Vec<AtomicUsize>> =
             StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
 
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn concurrent_steal_no_loss_no_duplication() {
         let w = Worker::<usize>::new();
-        let n: usize = 200_000;
+        let n: usize = if cfg!(miri) { 400 } else { 200_000 };
         let thieves = 4;
 
         let seen: StdArc<Vec<AtomicUsize>> =
@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn concurrent_batch_steal_no_loss() {
         let w = Worker::<usize>::new();
-        let n: usize = 100_000;
+        let n: usize = if cfg!(miri) { 400 } else { 100_000 };
         let thieves = 4;
 
         let seen: StdArc<Vec<AtomicUsize>> =

@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn concurrent_steal_at_least_once() {
         let mut w = LinkedWorker::<usize>::new();
-        let n = 200_000;
+        let n = if cfg!(miri) { 400 } else { 200_000 };
         let thieves = 4;
         for i in 0..n {
             w.put(i);

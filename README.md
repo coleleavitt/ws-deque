@@ -159,6 +159,11 @@ assert!(matches!(s.steal(), Take::Got(2)));
   `RUSTFLAGS="--cfg loom" cargo test --release loom_`.
 - **ThreadSanitizer** runs clean across every concurrent test and the `fib` example:
   `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --lib -Zbuild-std --target <triple>`.
+- **Miri** checks for undefined behaviour TSan can't see — invalid pointer provenance, misaligned
+  access, uninitialized reads (under Stacked Borrows): `cargo +nightly miri test --lib`. Tests
+  scale themselves down under `cfg!(miri)`. Miri **found a real UB bug** during hardening — a
+  `*const → *mut` cast in `bwos`'s slot writes violated Stacked Borrows; fixed by storing slots as
+  `AtomicU64` (atomic access through `&` is sound). This is exactly the class of bug TSan misses.
 - **`crossbeam-deque`'s own test suite, ported** (`tests/crossbeam_{lifo,fifo,steal}.rs`): the
   production crate's battle-tested stress tests — `smoke`, `spsc`, `stampede`, `stress`,
   `no_starvation`, and the exact-once `destructors` test — run against this crate's deque (8

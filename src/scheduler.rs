@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn parallel_sum_matches_sequential() {
         // Sum 0..N by spawning a task per element; checks correctness under load balancing.
-        let n = 200_000u64;
+        let n = if cfg!(miri) { 400u64 } else { 200_000u64 };
         let total = AtomicU64::new(0);
         run(8, 0..n, |i: u64, _sp| {
             total.fetch_add(i, Ordering::Relaxed);
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn locality_biased_parallel_sum() {
-        let n = 200_000u64;
+        let n = if cfg!(miri) { 400u64 } else { 200_000u64 };
         let total = AtomicU64::new(0);
         run_with(8, 4, 0..n, |i: u64, _sp| {
             total.fetch_add(i, Ordering::Relaxed);

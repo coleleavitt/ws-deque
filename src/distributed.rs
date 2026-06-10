@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn parallel_sum_across_nodes() {
-        let n = 100_000u64;
+        let n = if cfg!(miri) { 400u64 } else { 100_000u64 };
         let total = AtomicU64::new(0);
         let stats = run(4, 0..n, |i: u64, _sp| {
             total.fetch_add(i, O::Relaxed);
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn imbalanced_seed_is_balanced_by_stealing() {
         // All initial work starts on node 0 (others idle) — they must steal it via messages.
-        let n = 50_000usize;
+        let n = if cfg!(miri) { 300usize } else { 50_000usize };
         let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         // Seed a single root task that fans out, so node 0 starts with everything.
         run(4, [0usize], |start: usize, sp| {
