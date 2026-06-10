@@ -34,6 +34,10 @@ path = "examples/lifeline.rs"
 name = "branch_and_bound"
 path = "examples/branch_and_bound.rs"
 
+[[example]]
+name = "work_inflation"
+path = "examples/work_inflation.rs"
+
 [dev-dependencies]
 crossbeam-deque = "0.8"
 criterion = "0.5"

@@ -475,3 +475,48 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn loom_inline_owner_pop_vs_thief() {
+        loom::model(|| {
+            let w = InlineWorker::<u32>::with_log_capacity(4);
+            let s = w.stealer();
+            w.push(1);
+            w.push(2);
+
+            let thief = loom::thread::spawn(move || match s.steal() {
+                Steal::Success(v) => Some(v),
+                _ => None,
+            });
+
+            let owner = w.pop();
+            let stolen = thief.join().unwrap();
+
+            // Two items, two consumers, plus whatever remains: exact-once total (no value
+            // delivered twice, none lost) — even though values are inline bit-copies.
+            let mut remaining = 0;
+            while w.pop().is_some() {
+                remaining += 1;
+            }
+            let consumed = owner.is_some() as usize + stolen.is_some() as usize + remaining;
+            assert_eq!(consumed, 2, "every pushed value consumed exactly once");
+        });
+    }
+
+    #[test]
+    fn loom_inline_push_then_steal() {
+        loom::model(|| {
+            let w = InlineWorker::<u32>::with_log_capacity(4);
+            let s = w.stealer();
+            w.push(42);
+            let thief = loom::thread::spawn(move || matches!(s.steal(), Steal::Success(_)));
+            let stolen = thief.join().unwrap();
+            let popped = w.pop();
+            assert_eq!(stolen as usize + popped.is_some() as usize, 1);
+        });
+    }
+}

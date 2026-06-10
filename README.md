@@ -54,6 +54,7 @@ Examples:
 ```sh
 cargo run --example lifeline --release          # Unbalanced Tree Search, lifeline scheduler
 cargo run --example branch_and_bound --release  # A* vs Dijkstra, priority work-stealing
+cargo run --example work_inflation --release    # Acar work-inflation decomposition of cost
 cargo run --example fib --release -- 34 8       # raw-deque busy-wait scheduler (lower level)
 ```
 
@@ -107,7 +108,11 @@ A family of work-stealing structures, plus a scheduler that ties them together:
 | `linked` | `LinkedWorker` (approach 2) | linked-node store: **constant-time `put`, zero reclamation** |
 | `jiffy` | `channel()` → `Producer`/`Consumer` | wait-free **MPSC** injector (Jiffy) — the scheduler's lock-free inbox |
 | `priority` | `PriorityWorker<T, K>` | K priority levels — expand promising work first |
-| `scheduler` | `run` / `run_with` | lifeline fork-join driver; locality bias + lazy work-pushing |
+| `scheduler` | `run` / `run_with` / `run_with_config` | lifeline fork-join driver; locality bias, lazy work-pushing, **heartbeat granularity control** |
+
+**Verification:** every concurrent module is checked by both **loom** (exhaustive interleaving
+model-checking of bounded scenarios) and **ThreadSanitizer** (full test suite). See the coverage
+matrix and the RustMC/GenMC path in [`research/GAPS.md`](research/GAPS.md#verification-coverage-matrix).
 
 The WS-MULT family is a Rust implementation of Castañeda & Piña's *Fully Read/Write Fence-Free
 Work-Stealing with Multiplicity* (arXiv:2008.04424), which sidesteps the Attiya et al.

@@ -348,3 +348,46 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn loom_linked_take_vs_steal_at_least_once() {
+        loom::model(|| {
+            let mut w = LinkedWorker::<u32>::new();
+            w.put(1);
+            w.put(2);
+            let mut s = w.stealer();
+
+            let thief = loom::thread::spawn(move || {
+                let mut got = std::vec::Vec::new();
+                while let Take::Got(v) = s.steal() {
+                    got.push(v);
+                    if got.len() == 2 {
+                        break;
+                    }
+                }
+                got
+            });
+
+            let mut owner_got = std::vec::Vec::new();
+            while let Take::Got(v) = w.take() {
+                owner_got.push(v);
+                if owner_got.len() == 2 {
+                    break;
+                }
+            }
+            let thief_got = thief.join().unwrap();
+
+            // Multiplicity: each task delivered at least once, at most once per consumer.
+            for task in [1u32, 2] {
+                let n = owner_got.iter().filter(|&&v| v == task).count()
+                    + thief_got.iter().filter(|&&v| v == task).count();
+                assert!(n >= 1, "task {task} never delivered");
+                assert!(n <= 2, "task {task} delivered {n}× (> 2 consumers)");
+            }
+        });
+    }
+}

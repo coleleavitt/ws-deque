@@ -36,7 +36,11 @@ use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
-/// Slots per buffer node.
+/// Slots per buffer node. Tiny under `loom` so the model checker's state space stays tractable
+/// (loom tracks every atomic cell); production uses a cache-friendly larger buffer.
+#[cfg(loom)]
+const BUFFER_SIZE: usize = 4;
+#[cfg(not(loom))]
 const BUFFER_SIZE: usize = 1024;
 
 // Slot states (the paper's 2-bit `isSet`).
@@ -389,5 +393,36 @@ mod tests {
             assert_eq!(live.load(StdOrdering::SeqCst), 1500);
         }
         assert_eq!(live.load(StdOrdering::SeqCst), 0, "no leak / double-free");
+    }
+}
+
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn loom_two_producers_one_consumer_no_loss() {
+        loom::model(|| {
+            let (p, mut c) = channel::<u32>();
+            let p2 = p.clone();
+
+            let t1 = loom::thread::spawn(move || p.enqueue(1));
+            let t2 = loom::thread::spawn(move || p2.enqueue(2));
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // After both producers finish, the single consumer must drain exactly {1, 2}.
+            let mut got = std::vec::Vec::new();
+            while let Some(v) = c.dequeue() {
+                got.push(v);
+            }
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                std::vec![1, 2],
+                "both enqueued values dequeued exactly once"
+            );
+        });
     }
 }

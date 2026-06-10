@@ -158,6 +158,57 @@ backings — contiguous in `idempotent`, linked-list in `linked`).
 | Locality-hint API | ✅ | `Spawner::spawn_at` is the per-task hint; group-level bias (`run_with`) covers coarse NUMA placement. |
 | Work-first principle (cost on the steal, not the work, path) | ✅ | Honored: owner push/pop take no CAS on the common path; only steals and last-element pops CAS. |
 
+## Granularity control — heartbeat scheduling (Acar/Rainey; Wimmer spawn-to-call)
+
+The single most impactful *performance* idea common to every work-stealing system: **too many
+tiny tasks drown in scheduling overhead.** `scheduler::Spawner::spawn_or_call(task, serial)` and
+`should_promote()` + `run_with_config(workers, group_size, heartbeat_interval, …)` implement
+**amortized granularity control**: most spawn decisions run the work *inline* (a direct call, no
+deque push / no atomic / no wake), and only one in every `heartbeat_interval` is *promoted* to a
+real stealable task. This bounds scheduling overhead to a `1 / heartbeat_interval` fraction *no
+matter how finely the program spawns* — the principled form of Wimmer's "spawn-to-call
+conversion." Tested: a depth-16 binary tree (≈131k spawn decisions) completes correctly while
+*promoting* < 25% of them; a divide-and-conquer sum via `spawn_or_call` returns the exact total.
+TSan-clean.
+
+## Empirical analysis — work-inflation decomposition (Acar, arXiv:1709.03767)
+
+The crate now *attributes* its costs instead of reporting one number. `examples/work_inflation.rs`
+decomposes parallel slowdown into Acar's four factors (algorithmic overhead / scheduling overhead
+/ lack of parallelism / **work inflation** — the same ops costing more in parallel due to cache
+coherence, false sharing, atomics). The scheduler exposes `Stats { tasks, steals, steal_attempts }`
+via `run_with_config`. Measured on this machine: scheduling overhead ≈ **0.8%** (1-worker
+parallel vs sequential), and crucially the **boxed-vs-inline deque gap is 3.66× of pure work
+inflation** (allocation + atomic-pointer chase per element) — not algorithm. That number is the
+honest "why" behind the `inline` fast path.
+
+## Verification coverage matrix
+
+Two tools, with honest limits. **loom** exhaustively model-checks the atomic interleavings of
+*small hand-written scenarios* under a C11-style model (it cannot run the full test suite — the
+state space explodes). **ThreadSanitizer** runs the *full* concurrent tests but only observes
+interleavings that actually executed (it cannot *prove* race-freedom). Together they are strong;
+neither alone is a proof.
+
+| Module | loom | TSan | Notes |
+| --- | :-: | :-: | --- |
+| `lib` (Chase-Lev deque) | ✅ ×3 | ✅ | incl. grow-during-steal reclamation model |
+| `inline` (Copy deque) | ✅ ×2 | ✅ | owner-pop-vs-thief + push-then-steal |
+| `idempotent` (WS-MULT family) | ✅ | ✅ | multiplicity contract under interleaving |
+| `linked` (linked backing) | ✅ | ✅ | take-vs-steal at-least-once |
+| `jiffy` (MPSC injector) | ✅ | ✅ | 2-producer/1-consumer no-loss (tiny `BUFFER_SIZE` under loom) |
+| `priority` | — | ✅ | composes verified deques; no new orderings |
+| `scheduler` | — | ✅ | 10 tests incl. heartbeat + lazy-push, TSan-clean |
+
+**Beyond loom — `RustMC` / GenMC (deferred tooling, arXiv:2502.06293).** loom only checks code
+rewritten against `loom::sync`. **RustMC** extends the **GenMC** stateless model checker to real
+Rust via LLVM IR, exhaustively exploring *all* executions of the actual compiled program —
+including `unsafe`, raw-pointer atomics, and C/C++ FFI — under RC11. That is the principled way
+to machine-check the hand-justified `AtomicPtr`/CAS orderings these modules rely on (loom
+*approximates* this; GenMC would be a real proof). Documented as the next verification step; not
+yet wired into CI. **Miri** is also currently broken on this toolchain (`cargo miri` panics in
+its phase wrapper), so UB-detection (provenance/alignment/uninit) is presently via TSan only.
+
 ## Production-deque features (industry practice, beyond the papers)
 
 | Feature | Status | Notes |
@@ -225,7 +276,21 @@ single-retirer setting does not need their generality):
   (trade strict order for scalability); conceptual cousins of WS-MULT's multiplicity, a path
   to a *relaxed* injector if contention ever dominates.
 
-**Read, deferred (with reason):**
+**Implemented this round (verification, granularity, analysis):**
+- ✅ Acar, Charguéraud, Rainey, *Parallel Work Inflation, Memory Effects, and their Empirical
+  Analysis* (arXiv 1709.03767) — the **work-inflation decomposition** (`examples/work_inflation.rs`
+  + scheduler `Stats`). Attributes the boxed-vs-inline gap to work inflation (3.66×).
+- ✅ (granularity) heartbeat scheduling — `spawn_or_call` / `run_with_config`, the Acar/Rainey
+  amortized granularity-control idea; bounds scheduling overhead independent of spawn fineness.
+
+**Read, deferred (verification tooling & specialized scope):**
+- Pearce, Lange, O'Keeffe, *RustMC: Extending the GenMC stateless model checker to Rust*
+  (arXiv 2502.06293, 2025) — exhaustive LLVM-IR model checking of real Rust incl. unsafe/FFI; the
+  principled next step beyond loom for the `AtomicPtr`/CAS code. Deferred: a CI/tooling task, not
+  crate code. (See the verification matrix above.)
+- Westrick, Wang, Acar, *DePa: Order Maintenance for Task Parallelism* (arXiv 2204.14168) —
+  provably-efficient SP-order maintenance enabling *on-the-fly determinacy-race detection* of user
+  task graphs; a scheduler feature, deferred.
 - Fatourou, Giachoudis, Mallis, *Highly-Efficient Persistent FIFO Queues* (arXiv 2402.17674)
   — persistent-memory (NVRAM) recoverable queues; relevant if we ever target crash-consistent
   durability, orthogonal to a volatile work-stealing deque.

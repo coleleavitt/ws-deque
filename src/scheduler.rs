@@ -71,6 +71,28 @@ struct Shared<T> {
     /// prefers victims in its own group (contiguous worker-id ranges, a proxy for same-socket)
     /// before probing remote groups, cutting cross-NUMA traffic. `1` disables the bias.
     group_size: usize,
+    /// Heartbeat interval for `Spawner::spawn_or_call` granularity control: one in every
+    /// `heartbeat_interval` spawn decisions is promoted to a real stealable task; the rest run
+    /// inline. Larger = coarser tasks / less overhead, smaller = more parallelism. `1` promotes
+    /// every spawn (equivalent to always calling `spawn`).
+    heartbeat_interval: u32,
+    /// Successful cross-worker steals (a proxy for load-balancing / scheduling overhead, the
+    /// term Acar's work-inflation decomposition isolates). Read back via [`Stats`].
+    steals: AtomicUsize,
+    /// Steal *attempts* (successful or not) — the contention denominator.
+    steal_attempts: AtomicUsize,
+}
+
+/// Scheduling statistics returned by [`run_collect_stats`], for the Acar-style work-inflation
+/// decomposition (separating load-balancing cost from the actual computation).
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    /// Tasks promoted onto deques and executed (the dynamic task count).
+    pub tasks: usize,
+    /// Successful cross-worker steals.
+    pub steals: usize,
+    /// Total steal attempts (successful + failed); `steals / steal_attempts` is the hit rate.
+    pub steal_attempts: usize,
 }
 
 struct ParkState {
@@ -99,6 +121,8 @@ pub struct Spawner<'a, T> {
     deque: &'a Worker<T>,
     shared: &'a Shared<T>,
     me: usize,
+    /// Per-worker heartbeat counter for amortized granularity control (owner-only `Cell`).
+    heartbeat: core::cell::Cell<u32>,
 }
 
 impl<'a, T: Send> Spawner<'a, T> {
@@ -111,6 +135,40 @@ impl<'a, T: Send> Spawner<'a, T> {
         clear_lifelines(self.shared, self.me);
         // Wake parked workers to re-attempt stealing (they will now succeed).
         signal_work(self.shared);
+    }
+
+    /// **Heartbeat granularity control** (amortized; Acar/Rainey heartbeat scheduling, the
+    /// principled form of Wimmer's "spawn-to-call conversion"). Most calls run `serial(task)`
+    /// *inline* — no deque push, no atomic, no wake — so finely-spawned work pays zero
+    /// scheduling overhead. Only once every `heartbeat_interval` calls does it instead promote
+    /// the task to a real stealable [`spawn`](Self::spawn). This bounds total scheduling
+    /// overhead to a `1 / interval` fraction of spawn decisions, *regardless of how finely the
+    /// program spawns* — the standard fix for the "too many tiny tasks" pathology.
+    ///
+    /// Typical use in a divide-and-conquer body: `sp.spawn_or_call(child, |c| recurse(c, sp))`.
+    pub fn spawn_or_call<S: FnOnce(T)>(&self, task: T, serial: S) {
+        let next = self.heartbeat.get() + 1;
+        if next >= self.shared.heartbeat_interval {
+            self.heartbeat.set(0);
+            self.spawn(task); // promote: make this subtree stealable
+        } else {
+            self.heartbeat.set(next);
+            serial(task); // run inline — no scheduling overhead
+        }
+    }
+
+    /// Whether the next spawn decision should be *promoted* to a stealable task (a heartbeat
+    /// tick). Lets callers that can't express their serial path as a closure decide manually:
+    /// `if sp.should_promote() { sp.spawn(c) } else { run_inline(c) }`. Advances the heartbeat.
+    pub fn should_promote(&self) -> bool {
+        let next = self.heartbeat.get() + 1;
+        if next >= self.shared.heartbeat_interval {
+            self.heartbeat.set(0);
+            true
+        } else {
+            self.heartbeat.set(next);
+            false
+        }
     }
 
     /// **Lazy work-pushing** (Deters NUMA-WS): spawn a task with a *locality hint* — deposit it
@@ -174,8 +232,29 @@ pub fn run_with<T, F>(
     T: Send,
     F: Fn(T, &Spawner<'_, T>) + Sync,
 {
+    // Heartbeat 1 = promote every spawn (no granularity control by default).
+    run_with_config(workers, group_size, 1, initial, run);
+}
+
+/// The fully-configurable driver: locality `group_size` (Deters NUMA-WS) **and**
+/// `heartbeat_interval` for granularity control (Acar/Rainey heartbeat scheduling). With a
+/// `heartbeat_interval > 1`, `Spawner::spawn_or_call` runs most spawns inline and only promotes
+/// one in every `heartbeat_interval` to a stealable task — bounding scheduling overhead to a
+/// `1 / heartbeat_interval` fraction no matter how finely the program spawns.
+pub fn run_with_config<T, F>(
+    workers: usize,
+    group_size: usize,
+    heartbeat_interval: u32,
+    initial: impl IntoIterator<Item = T>,
+    run: F,
+) -> Stats
+where
+    T: Send,
+    F: Fn(T, &Spawner<'_, T>) + Sync,
+{
     let workers = workers.max(1);
     let group_size = group_size.clamp(1, workers);
+    let heartbeat_interval = heartbeat_interval.max(1);
 
     // Build one deque per worker; collect stealers up front. Each worker also gets a Jiffy MPSC
     // inbox: the producer lives in the shared slot, the single consumer is moved into the thread.
@@ -208,6 +287,9 @@ pub fn run_with<T, F>(
         wake: Condvar::new(),
         n: workers,
         group_size,
+        heartbeat_interval,
+        steals: AtomicUsize::new(0),
+        steal_attempts: AtomicUsize::new(0),
     });
 
     // Seed the initial tasks round-robin across worker deques, counting each as outstanding.
@@ -220,7 +302,11 @@ pub fn run_with<T, F>(
 
     // Empty workload: nothing to do.
     if seeded == 0 {
-        return;
+        return Stats {
+            tasks: 0,
+            steals: 0,
+            steal_attempts: 0,
+        };
     }
 
     std::thread::scope(|scope| {
@@ -232,6 +318,12 @@ pub fn run_with<T, F>(
             scope.spawn(move || worker_main(me, &deque, consumer, &shared, run));
         }
     });
+
+    Stats {
+        tasks: seeded + shared.steals.load(Ordering::Relaxed), // seeds + promoted-then-stolen
+        steals: shared.steals.load(Ordering::Relaxed),
+        steal_attempts: shared.steal_attempts.load(Ordering::Relaxed),
+    }
 }
 
 /// The per-worker main loop: drain locally, steal when empty, park when no work exists, exit at
@@ -246,7 +338,12 @@ fn worker_main<T, F>(
     T: Send,
     F: Fn(T, &Spawner<'_, T>) + Sync,
 {
-    let spawner = Spawner { deque, shared, me };
+    let spawner = Spawner {
+        deque,
+        shared,
+        me,
+        heartbeat: core::cell::Cell::new(0),
+    };
 
     loop {
         // 0. Drain our lazy-work-pushing inbox (Jiffy MPSC consumer) into our own deque. These
@@ -341,14 +438,19 @@ fn try_steal<T: Send>(me: usize, deque: &Worker<T>, shared: &Shared<T>) -> Optio
 }
 
 /// Steal a half-batch from `victim` into our deque, returning one task to run immediately.
+/// Records the attempt and (on success) the steal for the work-inflation decomposition.
 fn steal_one<T: Send>(
     shared: &Shared<T>,
     victim: usize,
     _me: usize,
     deque: &Worker<T>,
 ) -> Option<T> {
+    shared.steal_attempts.fetch_add(1, Ordering::Relaxed);
     match shared.slots[victim].stealer.steal_batch_and_pop(deque) {
-        Steal::Success(t) => Some(t),
+        Steal::Success(t) => {
+            shared.steals.fetch_add(1, Ordering::Relaxed);
+            Some(t)
+        }
         Steal::Empty | Steal::Retry => None,
     }
 }
@@ -474,6 +576,75 @@ mod tests {
             }
         });
         assert_eq!(counter.load(Ordering::Relaxed), 11);
+    }
+
+    /// Recursive tree walk used by the heartbeat test: each child is either *promoted* to a
+    /// stealable task (rare, counted) or recursed **inline** (common). Both paths visit every
+    /// node exactly once — the difference is only whether the scheduler sees a deque task.
+    fn visit_tree(v: u32, sp: &Spawner<'_, u32>, nodes: &AtomicUsize, promotions: &AtomicUsize) {
+        nodes.fetch_add(1, Ordering::Relaxed);
+        if v == 0 {
+            return;
+        }
+        for _ in 0..2 {
+            if sp.should_promote() {
+                promotions.fetch_add(1, Ordering::Relaxed);
+                sp.spawn(v - 1); // stealable; the run closure re-enters `visit_tree` on it
+            } else {
+                visit_tree(v - 1, sp, nodes, promotions); // inline — no scheduling overhead
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_granularity_reduces_promotions() {
+        // A binary tree of depth D has 2^(D+1)-1 nodes — normally that many spawns. With
+        // heartbeat control, most children recurse inline, so far fewer tasks are *promoted* to
+        // the deque, yet every node is visited exactly once.
+        let depth = 16u32;
+        let nodes = AtomicUsize::new(0);
+        let promotions = AtomicUsize::new(0);
+
+        // heartbeat_interval = 8 ⇒ ~1 in 8 spawn decisions is promoted.
+        run_with_config(8, 1, 8, [depth], |v: u32, sp| {
+            visit_tree(v, sp, &nodes, &promotions);
+        });
+
+        let total_nodes = (1usize << (depth + 1)) - 1;
+        assert_eq!(
+            nodes.load(Ordering::Relaxed),
+            total_nodes,
+            "every node visited once"
+        );
+        // The whole point: promotions are a small fraction of the spawn *decisions*.
+        let spawn_decisions = 2 * (total_nodes - (1usize << depth)); // 2 per internal node
+        let promoted = promotions.load(Ordering::Relaxed);
+        assert!(
+            promoted * 4 < spawn_decisions,
+            "heartbeat should promote far fewer than all spawns: {promoted} vs {spawn_decisions}"
+        );
+    }
+
+    #[test]
+    fn spawn_or_call_correct_result() {
+        // `spawn_or_call`: a recursive sum where most calls run inline, some promoted. The
+        // result must be exact regardless of which children were promoted vs inlined.
+        fn sum_range(lo: u64, hi: u64, sp: &Spawner<'_, (u64, u64)>, total: &AtomicU64) {
+            if hi - lo <= 1 {
+                total.fetch_add(lo, Ordering::Relaxed);
+                return;
+            }
+            let mid = lo + (hi - lo) / 2;
+            sp.spawn_or_call((lo, mid), |(a, b)| sum_range(a, b, sp, total));
+            sum_range(mid, hi, sp, total);
+        }
+
+        let n = 20_000u64;
+        let total = AtomicU64::new(0);
+        run_with_config(4, 1, 16, [(0u64, n)], |(lo, hi), sp| {
+            sum_range(lo, hi, sp, &total);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), n * (n - 1) / 2);
     }
 
     #[test]
