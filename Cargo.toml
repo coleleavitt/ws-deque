@@ -30,6 +30,10 @@ path = "examples/fib.rs"
 name = "lifeline"
 path = "examples/lifeline.rs"
 
+[[example]]
+name = "branch_and_bound"
+path = "examples/branch_and_bound.rs"
+
 [dev-dependencies]
 crossbeam-deque = "0.8"
 criterion = "0.5"

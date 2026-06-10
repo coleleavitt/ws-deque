@@ -56,6 +56,7 @@
 //!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
 
 pub mod idempotent;
+pub mod priority;
 pub mod scheduler;
 
 use std::boxed::Box;

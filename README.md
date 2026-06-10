@@ -35,11 +35,26 @@ run(8, [20u32], |depth, spawner| {        // 8 workers, one seed task
 // runs the whole dynamically-unfolding tree to completion, then returns
 ```
 
+Need **priority** (expand promising work first)? `priority::PriorityWorker<T, K>` layers `K`
+priority levels over the deque — `pop`/`steal` always take the highest-priority task. On A\* vs
+Dijkstra it explores ~5× fewer nodes for the same optimum (the Wimmer "priority reduces total
+work" result):
+
+```rust
+use ws_deque::priority::PriorityWorker;
+
+let w = PriorityWorker::<&str, 3>::new();  // 3 levels, 0 = highest
+w.push("background", 2);
+w.push("urgent", 0);
+assert_eq!(w.pop(), Some("urgent"));        // highest priority first
+```
+
 Examples:
 
 ```sh
-cargo run --example lifeline --release -- 8 30 3   # Unbalanced Tree Search, lifeline scheduler
-cargo run --example fib --release -- 34 8          # raw-deque busy-wait scheduler (lower level)
+cargo run --example lifeline --release          # Unbalanced Tree Search, lifeline scheduler
+cargo run --example branch_and_bound --release  # A* vs Dijkstra, priority work-stealing
+cargo run --example fib --release -- 34 8       # raw-deque busy-wait scheduler (lower level)
 ```
 
 ## Why another deque?

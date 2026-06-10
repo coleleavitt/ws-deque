@@ -3,6 +3,32 @@
 What the source papers (see `SYNTHESIS.md`) contain, and what this crate does vs defers.
 Status: ✅ implemented · 🟡 partial · ⬜ deferred (with rationale).
 
+## ⭐ Breakthrough: priority work-stealing (`src/priority.rs`)
+
+Wimmer, Cederman, Träff & Tsigas, *Configurable Strategies for Work-Stealing*
+(arXiv:1305.6474). Implemented as `priority::PriorityWorker<T, K>` / `PriorityStealer<T, K>`.
+
+**Why it matters.** Standard work-stealing is *oblivious* to task importance — execution order
+is whatever LIFO/FIFO falls out of the deque. Wimmer et al. show that letting a task carry a
+**priority** (a steal/execution-order hint) reduces the *total work* for search algorithms:
+branch-and-bound and best-first/shortest-path expand promising nodes first, pruning the rest
+before they are ever touched.
+
+**Design:** `K` const-generic priority levels, each an independent **verified Chase-Lev
+deque**. `push(task, level)`, and `pop`/`steal` scan highest-priority-first. Because each level
+is the already-proven deque, the composition inherits exact-once semantics, race-freedom, and
+the loom-checked orderings; the only new logic is the highest-first scan (plain control flow).
+
+**Status:** ✅ `PriorityWorker`/`PriorityStealer`, level clamping, highest-first pop/steal.
+4 tests (priority order, steal preference, clamp, concurrent no-loss), **ThreadSanitizer-clean**.
+`examples/branch_and_bound.rs` runs A\* vs Dijkstra on a 120×120 obstacle grid: A\*
+(heuristic-prioritized) expands **~5× fewer nodes** for the identical optimal cost — the
+Wimmer "priority reduces total work" result, made measurable.
+
+⬜ Deferred: a true unbounded priority (we bucket into `K` fixed levels — fine for A\*/B&B,
+coarser than a comparison heap); per-task *strategies* beyond priority (call-conversion,
+granularity hints) from the same paper.
+
 ## ⭐ Breakthrough: lifeline-graph scheduler (`src/scheduler.rs`)
 
 Saraswat et al., *Lifeline-based Global Load Balancing* (PPoPP'11), packaged by Zhang et al.,
@@ -136,10 +162,25 @@ small-value payloads (an inline atomic-cell fast path) is the obvious next optim
 ## Additional literature pulled
 
 **Implemented:**
+- ⭐ Wimmer, Cederman, Träff & Tsigas, *Configurable Strategies for Work-Stealing*
+  (arXiv 1305.6474) — **the priority work-stealing breakthrough above** (`src/priority.rs`).
 - ⭐ Castañeda & Piña, *Fully Read/Write Fence-Free Work-Stealing with Multiplicity*
-  (arXiv 2008.04424) — **the WS-MULT breakthrough above** (`src/idempotent.rs`).
+  (arXiv 2008.04424) — **the WS-MULT breakthrough** (`src/idempotent.rs`).
 - ⭐ Saraswat et al. / Zhang et al., *Lifeline-based Global Load Balancing* / *GLB*
-  (arXiv 1312.5691) — **the lifeline scheduler above** (`src/scheduler.rs`).
+  (arXiv 1312.5691) — **the lifeline scheduler** (`src/scheduler.rs`).
+
+**Read, deferred (safe memory reclamation — the principled fix for retain-until-drop):**
+The deque currently retains grown-out buffers until the whole deque drops (memory bounded by
+`O(log max_len)` arrays, never freed mid-life). To free them *while live* without a use-after-
+free against in-flight thieves needs a real SMR scheme:
+- Nikolaev & Ravindran, *Hyaline: Snapshot-Free, Transparent, Robust Memory Reclamation*
+  (arXiv 1905.07903) — reference-counting-on-retire SMR with balanced reclamation work; the
+  cleanest drop-in for freeing retired buffers. The strongest candidate.
+- Nikolaev & Ravindran, *Crystalline: Fast and Memory-Efficient Wait-Free Reclamation*
+  (arXiv 2108.02763) and *WFE: Universal Wait-Free Memory Reclamation* (arXiv 2001.01999) —
+  wait-free reclamation; stronger progress at higher complexity.
+  Deferred because retain-until-drop is *correct* and dependency-free; reclamation is a
+  memory-footprint optimization, not a correctness fix.
 
 **Read, deferred (queue building blocks for a scheduler's global injector):**
 - Nikolaev & Ravindran, *wCQ: A Fast Wait-Free Queue with Bounded Memory Usage*
