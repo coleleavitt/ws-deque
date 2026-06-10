@@ -54,6 +54,36 @@ a `SeqCst` fence. The result is **race-free by construction** — `cargo +nightl
 - **Correct `Drop`.** Every boxed element is freed exactly once — verified with a
   drop-counting test (no leaks, no double-frees).
 
+## Two algorithms
+
+This crate ships two work-stealing data structures:
+
+| | `Worker` / `Stealer` (Chase-Lev) | `idempotent::IdempotentWorker` (WS-MULT) |
+| --- | --- | --- |
+| Contract | every task runs **exactly once** | every task runs **≥1 times** (multiplicity ≤ #threads) |
+| `push`/`put` | store + `Release` | **plain store — no CAS, no fence** |
+| `pop`/`take` | `SeqCst` fence + maybe CAS | monotone `fetch_max`, **no retry** |
+| `steal` | CAS-abort loop | `fetch_max`, **no retry** |
+| Use for | side effects, accounting, exactly-once | idempotent work: SAT, graph search, fixpoint |
+
+The second is a Rust implementation of Castañeda & Piña's *Fully Read/Write Fence-Free
+Work-Stealing with Multiplicity* (arXiv:2008.04424). It sidesteps the Attiya et al.
+impossibility result (exact-once work-stealing *must* use a fence or CAS) by relaxing to
+multiplicity — and is measured ~1.4× faster than the Chase-Lev `pop`/`push` path on this
+machine because it carries neither the fence nor the CAS. See
+[`research/GAPS.md`](research/GAPS.md#-breakthrough-ws-mult--fence-free-cas-free-work-stealing-srcidempotentrs).
+
+```rust
+use ws_deque::idempotent::{IdempotentWorker, Take};
+
+let mut w = IdempotentWorker::new();   // T: Clone (a task may be delivered more than once)
+let s = w.stealer();
+w.put(1);
+w.put(2);
+assert_eq!(w.take(), Take::Got(1));     // FIFO, fence-free, no CAS
+assert!(matches!(s.steal(), Take::Got(2)));
+```
+
 ## Correctness & performance
 
 - **`loom`** exhaustively model-checks the push/pop/steal interleavings:

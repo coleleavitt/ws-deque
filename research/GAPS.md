@@ -3,6 +3,41 @@
 What the source papers (see `SYNTHESIS.md`) contain, and what this crate does vs defers.
 Status: ✅ implemented · 🟡 partial · ⬜ deferred (with rationale).
 
+## ⭐ Breakthrough: WS-MULT — fence-free, CAS-free work-stealing (`src/idempotent.rs`)
+
+Castañeda & Piña, *Fully Read/Write Fence-Free Work-Stealing with Multiplicity*
+(arXiv:2008.04424), implemented as `idempotent::IdempotentWorker` / `IdempotentStealer`.
+
+**Why it matters.** Attiya et al.'s impossibility result proves that *exact-once*
+work-stealing **must** use a read-modify-write (CAS) **or** a memory fence on the hot path —
+Chase-Lev pays both (CAS on steal, `SeqCst` fence on every pop). WS-MULT escapes the
+impossibility by relaxing to **multiplicity**: each task is delivered **≥1 times**, with the
+count bounded by the number of concurrent consumers. Under that relaxation:
+
+| Operation | Chase-Lev (exact-once) | WS-MULT (multiplicity) |
+| --- | --- | --- |
+| `put` / `push` | store + `Release` | **plain store, no CAS, no fence** |
+| `take` / `pop` | `SeqCst` fence + maybe CAS | monotone `fetch_max`, **no retry** |
+| `steal` | CAS-abort loop (`Retry`) | `fetch_max`, **no retry** |
+
+**Mechanism:** the `head` is a monotone *MaxRegister* (`fetch_max`); it can only move forward,
+so a slow consumer can never rewind the queue. Two consumers take the same task only if they
+read the same `head` concurrently → multiplicity ≤ thread count (strictly better than the
+*unbounded* re-extraction of Michael et al.'s idempotent work-stealing, which WS-MULT improves
+on — see the paper's "Idempotent ≠ Multiplicity" section).
+
+**Status:** ✅ FIFO WS-MULT with growable array, owner `put`/`take`, thief `steal`, `T: Clone`.
+Tested (FIFO order, growth, no-phantom-tasks, concurrent multiplicity-bounded), **loom**
+model-checked, **ThreadSanitizer-clean** (genuinely race-free *without* a fence — the whole
+point). Measured ~1.4× faster owner put/take than Chase-Lev (137 µs vs 192 µs, N=4096),
+isolating the eliminated fence+CAS. Use for idempotent workloads (parallel SAT, graph search,
+fixpoint, branch-and-bound); use `Worker` when exactly-once is required.
+
+⬜ Deferred from this paper: the linked-list array backing (paper's approach 2, better under
+heavy growth — we use approach 1, doubling); the swap-based *bounded-multiplicity* `Steal`
+variant (B-WS-MULT) that guarantees no two **thieves** take the same task; the weak-multiplicity
+FIFO variant (WS-WMULT).
+
 ## Chase & Lev, *Dynamic Circular Work-Stealing Deque* (SPAA'05) — the core paper
 
 | § | Idea | Status | Notes |
@@ -64,18 +99,28 @@ UB" — faster, but TSan flags it. For a job queue that enqueues `Box`/`Arc` tas
 common case), the extra allocation is largely amortized. Closing the gap for `T: Copy` /
 small-value payloads (an inline atomic-cell fast path) is the obvious next optimization.
 
-## Additional literature pulled this round
+## Additional literature pulled
 
+**Implemented:**
+- ⭐ Castañeda & Piña, *Fully Read/Write Fence-Free Work-Stealing with Multiplicity*
+  (arXiv 2008.04424) — **the WS-MULT breakthrough above** (`src/idempotent.rs`).
+
+**Read, deferred (with reason):**
+- Fatourou, Giachoudis, Mallis, *Highly-Efficient Persistent FIFO Queues* (arXiv 2402.17674)
+  — persistent-memory (NVRAM) recoverable queues; relevant if we ever target crash-consistent
+  durability, orthogonal to a volatile work-stealing deque.
+- Motiwala, *No Cords Attached: Coordination-Free Concurrent Lock-Free Queues*
+  (arXiv 2511.09410, 2025) — coordination-free MPMC FIFO queues; a different shape (multi-
+  producer) than single-owner work-stealing, but a candidate for the global *injector* queue a
+  scheduler built on this crate would need.
 - John, Milthorpe, Strazdins, *Distributed Work Stealing in a Task-Based Dataflow Runtime*
-  (arXiv 2211.00838) — extends work stealing across nodes; relevant only to a distributed
-  scheduler, not a shared-memory deque.
+  (arXiv 2211.00838) — extends work stealing across nodes; distributed-scheduler scope.
 - Khatiri, Trystram, Wagner, *Work Stealing Simulator* (arXiv 1910.02803) — models steal
   latency; useful for evaluating victim-selection policies if we add NUMA bias.
 - Suksompong, Leiserson, Schardl, *On the Efficiency of Localized Work Stealing* (arXiv
-  1804.04773) — bounds the overhead of locality-biased stealing; the theory backing a future
-  NUMA scheduler.
+  1804.04773) — bounds the overhead of locality-biased stealing; theory for a future NUMA
+  scheduler.
 
-> Searched arXiv (semantic + keyword) and DOI/Unpaywall for newer non-blocking / weak-memory
-> deque work (idempotent/relaxed deques, BWoS-style bounded queues). The canonical newer
-> results are paywalled or conference-only; the verification (Choi) and weak-memory (Lê)
-> papers already captured here are the load-bearing ones for a correct implementation.
+> Method: arXiv (semantic + keyword), DOI/Unpaywall, and OpenAlex. The fence-free WS-MULT
+> result (Castañeda-Piña) was the highest-value implementable find — it changes the
+> *asymptotics of synchronization* (removes the mandatory fence/CAS), not just constants.

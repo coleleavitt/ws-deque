@@ -47,6 +47,15 @@
 //! standalone use. See `research/` for the source papers and `research/SYNTHESIS.md` for the
 //! design notes, including the ThreadSanitizer data-race finding that motivated the
 //! atomic-cell storage.
+//!
+//! ## Two algorithms in this crate
+//!
+//! - [`Worker`] / [`Stealer`] — the **exact-once** Chase-Lev deque (this module). Every task
+//!   runs exactly once; pays a CAS on steal and a `SeqCst` fence on pop.
+//! - [`idempotent`] — **WS-MULT**, a fence-free, CAS-free work-stealing queue with
+//!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
+
+pub mod idempotent;
 
 use std::boxed::Box;
 use std::ptr;
