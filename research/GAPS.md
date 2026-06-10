@@ -3,6 +3,40 @@
 What the source papers (see `SYNTHESIS.md`) contain, and what this crate does vs defers.
 Status: ✅ implemented · 🟡 partial · ⬜ deferred (with rationale).
 
+## ⭐ Breakthrough: lifeline-graph scheduler (`src/scheduler.rs`)
+
+Saraswat et al., *Lifeline-based Global Load Balancing* (PPoPP'11), packaged by Zhang et al.,
+*GLB* (arXiv:1312.5691). Implemented as `scheduler::run` — a `parallel_for`/fork-join driver
+over N worker threads, each owning a Chase-Lev deque.
+
+**Why it matters.** A naive work-stealing loop (like `examples/fib.rs`) *busy-waits*: idle
+workers spin-steal at random, burning cores, with no clean way to detect "everyone is done."
+The lifeline algorithm fixes both problems:
+
+- **Two-round stealing:** `w = ⌈log₂ N⌉` random victims first (cheap, handles bursty
+  imbalance), then fall back to **lifeline buddies** — neighbours in a **hypercube** graph
+  (degree & diameter both `log N`, strongly connected).
+- **Spin-free idling:** when stealing fails, a worker *registers* on its buddies' lifelines and
+  **parks** on a condvar (no spin). A worker that obtains work bumps a generation counter and
+  wakes parked buddies, who then steal successfully.
+- **Robust distributed termination:** a global `outstanding` task counter (incremented on
+  spawn, decremented on completion) hits 0 *exactly* when the computation is done — wake-all
+  and exit. This is sound against racy steals, unlike counting idle workers.
+
+**Status:** ✅ `scheduler::run(workers, initial, |task, spawner| …)`; hypercube lifelines,
+two-round stealing via `steal_batch_and_pop`, condvar parking, outstanding-based termination.
+Tested (hypercube topology, irregular tree of 2¹⁹−1 dynamically-spawned nodes, 200k parallel
+sum, single-worker), **25× stress-looped** for termination races, **ThreadSanitizer-clean**
+(lib tests + a live 6-worker example run). `examples/lifeline.rs` runs an Unbalanced Tree
+Search (~830k irregular nodes, 8 workers).
+
+> **Bug found & fixed via TSan during this work:** the scheduler's near-empty deques exposed a
+> latent double-free in `steal_batch_and_pop` — a single top-CAS claiming a multi-slot range
+> could overlap the owner's CAS-free bottom `pop`. Reworked batch stealing to loop the
+> individually-correct single `steal`, preserving the amortization while being provably sound.
+> (Both the original single-CAS batch *and* its test passed before; only the scheduler's tight
+> deques surfaced it — exactly why a real consumer + a sanitizer matter.)
+
 ## ⭐ Breakthrough: WS-MULT — fence-free, CAS-free work-stealing (`src/idempotent.rs`)
 
 Castañeda & Piña, *Fully Read/Write Fence-Free Work-Stealing with Multiplicity*
@@ -104,6 +138,21 @@ small-value payloads (an inline atomic-cell fast path) is the obvious next optim
 **Implemented:**
 - ⭐ Castañeda & Piña, *Fully Read/Write Fence-Free Work-Stealing with Multiplicity*
   (arXiv 2008.04424) — **the WS-MULT breakthrough above** (`src/idempotent.rs`).
+- ⭐ Saraswat et al. / Zhang et al., *Lifeline-based Global Load Balancing* / *GLB*
+  (arXiv 1312.5691) — **the lifeline scheduler above** (`src/scheduler.rs`).
+
+**Read, deferred (queue building blocks for a scheduler's global injector):**
+- Nikolaev & Ravindran, *wCQ: A Fast Wait-Free Queue with Bounded Memory Usage*
+  (arXiv 2201.02179) — wait-free MPMC FIFO with bounded memory; the strongest candidate if
+  the scheduler grows a shared global injector queue. Deferred: heavier than needed while
+  per-worker deques + lifelines suffice.
+- Adas & Friedman, *Jiffy: Wait-Free Multi-Producer Single-Consumer Queue* (arXiv 2010.14189)
+  — MPSC; fits a single-consumer aggregation/result channel.
+- von Geijer & Tsigas, *How to Relax Instantly: Elastic Relaxation of Concurrent Data
+  Structures* (arXiv 2403.13644) and Rukundo, Atalar & Tsigas, *Relaxing Concurrent
+  Data-structure Semantics … 2D Framework* (arXiv 1906.07105) — tunable semantic relaxation
+  (trade strict order for scalability); conceptual cousins of WS-MULT's multiplicity, a path
+  to a *relaxed* injector if contention ever dominates.
 
 **Read, deferred (with reason):**
 - Fatourou, Giachoudis, Mallis, *Highly-Efficient Persistent FIFO Queues* (arXiv 2402.17674)

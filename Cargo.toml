@@ -26,6 +26,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 name = "fib"
 path = "examples/fib.rs"
 
+[[example]]
+name = "lifeline"
+path = "examples/lifeline.rs"
+
 [dev-dependencies]
 crossbeam-deque = "0.8"
 criterion = "0.5"

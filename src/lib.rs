@@ -56,6 +56,7 @@
 //!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
 
 pub mod idempotent;
+pub mod scheduler;
 
 use std::boxed::Box;
 use std::ptr;
@@ -463,47 +464,40 @@ impl<T> Stealer<T> {
     /// The whole batch is claimed with a single `compare_exchange` that advances `top` by the
     /// batch size, so a losing thief retries cleanly and no element is taken twice. `dest`
     /// must be a fresh/owned `Worker` (typically the thief's own empty deque).
+    ///
+    /// # Implementation note
+    ///
+    /// Each item is claimed with an independent single-item [`steal`](Stealer::steal) (which
+    /// is individually linearizable, loom-checked, and TSan-clean). A *single-CAS* batch claim
+    /// is unsound against this crate's Chase-Lev owner, whose non-last `pop` takes from the
+    /// bottom **without** a CAS — a multi-slot top-claim can then overlap the owner's pops and
+    /// double-free. Looping single steals keeps the same amortization-of-scheduling benefit
+    /// (one call drains ~half a victim) while staying provably correct.
     pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
         let inner = &*self.inner;
+        // Estimate how many to take (about half) from a consistent snapshot of the indices.
         let t = inner.top.load(Ordering::Acquire);
         fence(Ordering::SeqCst);
         let b = inner.bottom.load(Ordering::Acquire);
-
         let available = b - t;
         if available <= 0 {
             return Steal::Empty;
         }
+        let want = ((available + 1) / 2) as usize; // ceil(half), at least 1
 
-        // Take half (rounded up), capped so we always leave the contract simple. The first of
-        // the batch is returned to the caller; the rest go into `dest`.
-        let batch = ((available + 1) / 2).min(available);
-        let buf_ptr = inner.buffer.load(Ordering::Acquire);
-
-        // Read all pointers in the batch BEFORE the CAS (the owner may refill these slots
-        // after a successful CAS). Reads are atomic, so they cannot race the owner's push.
-        // SAFETY: indices `t..t+batch` are all `< b`, hence live in the loaded buffer.
-        let first = unsafe { (*buf_ptr).read(t) };
-        let mut rest: Vec<*mut T> = Vec::with_capacity((batch - 1) as usize);
-        for off in 1..batch {
-            rest.push(unsafe { (*buf_ptr).read(t + off) });
-        }
-
-        // Claim the entire batch with one CAS advancing `top` by `batch`.
-        if inner
-            .top
-            .compare_exchange(t, t + batch, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            // We own every box in the batch. Push the remainder into `dest`, return the first.
-            for p in rest {
-                // SAFETY: `p` is a uniquely-owned boxed element we just claimed.
-                dest.push(unsafe { *Box::from_raw(p) });
+        // First successful steal is returned to the caller; the rest go into `dest`.
+        let first = match self.steal() {
+            Steal::Success(v) => v,
+            // Empty/Retry: report it so the caller can move on or retry.
+            other => return other,
+        };
+        for _ in 1..want {
+            match self.steal() {
+                Steal::Success(v) => dest.push(v),
+                Steal::Empty | Steal::Retry => break, // victim drained or contended; stop early
             }
-            Steal::Success(unsafe { *Box::from_raw(first) })
-        } else {
-            // Lost the race; every pointer we read belongs to the winner. Free nothing.
-            Steal::Retry
         }
+        Steal::Success(first)
     }
 }
 

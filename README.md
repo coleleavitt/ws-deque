@@ -16,10 +16,30 @@ assert_eq!(worker.pop(), Some(2));   // owner pops LIFO
 assert!(matches!(stealer.steal(), Steal::Success(1))); // thieves take FIFO
 ```
 
-See `examples/fib.rs` for a complete multi-threaded work-stealing scheduler:
+Or use the built-in **lifeline-graph scheduler** for irregular fork-join workloads — idle
+workers park spin-free and are woken via a hypercube lifeline graph, with clean distributed
+termination:
+
+```rust
+use ws_deque::scheduler::run;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+let count = AtomicUsize::new(0);
+run(8, [20u32], |depth, spawner| {        // 8 workers, one seed task
+    count.fetch_add(1, Ordering::Relaxed);
+    if depth > 0 {
+        spawner.spawn(depth - 1);          // each task may spawn more
+        spawner.spawn(depth - 1);
+    }
+});
+// runs the whole dynamically-unfolding tree to completion, then returns
+```
+
+Examples:
 
 ```sh
-cargo run --example fib --release -- 34 8     # parallel fib(34) across 8 workers
+cargo run --example lifeline --release -- 8 30 3   # Unbalanced Tree Search, lifeline scheduler
+cargo run --example fib --release -- 34 8          # raw-deque busy-wait scheduler (lower level)
 ```
 
 ## Why another deque?
