@@ -55,11 +55,14 @@
 //! - [`idempotent`] — **WS-MULT**, a fence-free, CAS-free work-stealing queue with
 //!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
 
+pub mod distributed;
 pub mod idempotent;
 pub mod inline;
 pub mod jiffy;
 pub mod linked;
+pub mod persistent;
 pub mod priority;
+pub mod race;
 pub mod scheduler;
 
 use std::boxed::Box;

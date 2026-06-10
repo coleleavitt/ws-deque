@@ -109,10 +109,14 @@ A family of work-stealing structures, plus a scheduler that ties them together:
 | `jiffy` | `channel()` → `Producer`/`Consumer` | wait-free **MPSC** injector (Jiffy) — the scheduler's lock-free inbox |
 | `priority` | `PriorityWorker<T, K>` | K priority levels — expand promising work first |
 | `scheduler` | `run` / `run_with` / `run_with_config` | lifeline fork-join driver; locality bias, lazy work-pushing, **heartbeat granularity control** |
+| `distributed` | `run` (shared-nothing nodes) | message-passing distributed work-stealing — steal requests, half victim policy |
+| `race` | `Dag` / `detect_races` | DePa **determinacy-race detection** (SP-order) — schedule-independent |
+| `persistent` | `PersistentQueue` | crash-recoverable NVM FIFO — `pwb`/`psync` model + recovery |
 
 **Verification:** every concurrent module is checked by both **loom** (exhaustive interleaving
-model-checking of bounded scenarios) and **ThreadSanitizer** (full test suite). See the coverage
-matrix and the RustMC/GenMC path in [`research/GAPS.md`](research/GAPS.md#verification-coverage-matrix).
+model-checking of bounded scenarios) and **ThreadSanitizer** (full test suite), run on every push
+by [`.github/workflows/ci.yml`](.github/workflows/ci.yml). See the coverage matrix and the
+RustMC/GenMC path in [`research/GAPS.md`](research/GAPS.md#verification-coverage-matrix).
 
 The WS-MULT family is a Rust implementation of Castañeda & Piña's *Fully Read/Write Fence-Free
 Work-Stealing with Multiplicity* (arXiv:2008.04424), which sidesteps the Attiya et al.

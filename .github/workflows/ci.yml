@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Fast checks on stable: format, lint, build, unit + doc tests.
+  test:
+    name: test / fmt / clippy (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets, warnings = errors)
+        run: cargo clippy --all-targets --all-features
+      - name: Unit + doc tests
+        run: cargo test --all-features
+      - name: Build examples
+        run: cargo build --examples --release
+
+  # loom: exhaustive interleaving model-checking of the bounded scenarios.
+  loom:
+    name: loom model checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom suite
+        # `--cfg loom` swaps std atomics for loom's, exploring every legal interleaving.
+        run: RUSTFLAGS="--cfg loom" cargo test --release loom_
+
+  # ThreadSanitizer: full concurrent test suite under the data-race detector.
+  # Requires nightly + a from-source std build (-Zbuild-std) so the sanitizer instruments std.
+  sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+        run: |
+          cargo +nightly test --lib \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu
+
+  # Minimum-supported-Rust-version build (no -D warnings, just must compile).
+  msrv:
+    name: MSRV (1.73)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.73.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features

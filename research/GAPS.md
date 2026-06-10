@@ -283,28 +283,38 @@ single-retirer setting does not need their generality):
 - ✅ (granularity) heartbeat scheduling — `spawn_or_call` / `run_with_config`, the Acar/Rainey
   amortized granularity-control idea; bounds scheduling overhead independent of spawn fineness.
 
-**Read, deferred (verification tooling & specialized scope):**
-- Pearce, Lange, O'Keeffe, *RustMC: Extending the GenMC stateless model checker to Rust*
-  (arXiv 2502.06293, 2025) — exhaustive LLVM-IR model checking of real Rust incl. unsafe/FFI; the
-  principled next step beyond loom for the `AtomicPtr`/CAS code. Deferred: a CI/tooling task, not
-  crate code. (See the verification matrix above.)
-- Westrick, Wang, Acar, *DePa: Order Maintenance for Task Parallelism* (arXiv 2204.14168) —
-  provably-efficient SP-order maintenance enabling *on-the-fly determinacy-race detection* of user
-  task graphs; a scheduler feature, deferred.
-- Fatourou, Giachoudis, Mallis, *Highly-Efficient Persistent FIFO Queues* (arXiv 2402.17674)
-  — persistent-memory (NVRAM) recoverable queues; relevant if we ever target crash-consistent
-  durability, orthogonal to a volatile work-stealing deque.
+**Implemented (final round — CI, race detection, distributed, persistence):**
+- ✅ Pearce, Lange, O'Keeffe, *RustMC: Extending GenMC to Rust* (arXiv 2502.06293) — the
+  verification *path* is now realized operationally: `.github/workflows/ci.yml` runs the full
+  loom suite **and** ThreadSanitizer (`-Zsanitizer=thread -Zbuild-std`) on every push, plus
+  fmt/clippy/MSRV. (A literal GenMC run still needs that external tool; CI gives continuous
+  loom+TSan coverage of the matrix above.)
+- ✅ Westrick, Wang, Acar, *DePa: Order Maintenance for Task Parallelism* (arXiv 2204.14168) —
+  the `race` module: SP-order (English/Hebrew rank) determinacy-race detection. Flags parallel
+  write-conflicts (shared accumulator) and clears race-free fork-join reductions, *independent
+  of schedule* — stronger than TSan's sampling. 8 tests.
+- ✅ John, Milthorpe, Strazdins, *Distributed Work Stealing* (arXiv 2211.00838) — the
+  `distributed` module: shared-nothing nodes, message-passing steal requests, randomized victim
+  selection, half victim policy, distributed termination. Balances an all-on-node-0 seed purely
+  by messages. 4 tests, TSan-clean.
+- ✅ Fatourou, Giachoudis, Mallis, *Highly-Efficient Persistent FIFO Queues* (arXiv 2402.17674) —
+  the `persistent` module: an explicit NVM persistency model (`pwb`/`psync`, simulated since no
+  NVRAM hardware) with crash + recovery. Durably-enqueued items survive a crash at *any* point;
+  un-`psync`'d ones are correctly lost; no duplicates/resurrection. 5 tests incl. crash-at-every-
+  point consistency.
+
+**Read, deferred (genuinely different scope):**
 - Motiwala, *No Cords Attached: Coordination-Free Concurrent Lock-Free Queues*
-  (arXiv 2511.09410, 2025) — coordination-free MPMC FIFO queues; a different shape (multi-
-  producer) than single-owner work-stealing, but a candidate for the global *injector* queue a
-  scheduler built on this crate would need.
-- John, Milthorpe, Strazdins, *Distributed Work Stealing in a Task-Based Dataflow Runtime*
-  (arXiv 2211.00838) — extends work stealing across nodes; distributed-scheduler scope.
-- Khatiri, Trystram, Wagner, *Work Stealing Simulator* (arXiv 1910.02803) — models steal
-  latency; useful for evaluating victim-selection policies if we add NUMA bias.
+  (arXiv 2511.09410, 2025) — coordination-free MPMC FIFO; a multi-producer/multi-consumer shape,
+  only relevant as an alternate *multi-consumer* injector (our Jiffy inbox is MPSC, which the
+  scheduler needs).
+- Khatiri, Trystram, Wagner, *Work Stealing Simulator* (arXiv 1910.02803) — a modelling/eval
+  tool, not a data structure.
 - Suksompong, Leiserson, Schardl, *On the Efficiency of Localized Work Stealing* (arXiv
-  1804.04773) — bounds the overhead of locality-biased stealing; theory for a future NUMA
-  scheduler.
+  1804.04773) — analysis backing the locality bias already implemented in `run_with`.
+- A literal **GenMC/RustMC** run and a **real-NVM** persistent-queue benchmark both need external
+  tooling/hardware this machine lacks; the CI loom+TSan jobs and the software persistency model
+  are the faithful in-reach substitutes.
 
 > Method: arXiv (semantic + keyword), DOI/Unpaywall, and OpenAlex. The fence-free WS-MULT
 > result (Castañeda-Piña) was the highest-value implementable find — it changes the
