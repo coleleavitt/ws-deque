@@ -93,11 +93,28 @@ a `SeqCst` fence. The result is **race-free by construction** — `cargo +nightl
 - **Correct `Drop`.** Every boxed element is freed exactly once — verified with a
   drop-counting test (no leaks, no double-frees).
 
-## Two algorithms
+## Algorithms in this crate
 
-This crate ships two work-stealing data structures:
+A family of work-stealing structures, plus a scheduler that ties them together:
 
-| | `Worker` / `Stealer` (Chase-Lev) | `idempotent::IdempotentWorker` (WS-MULT) |
+| Module | Type | Contract / niche |
+| --- | --- | --- |
+| (root) | `Worker` / `Stealer` (Chase-Lev) | **exact-once**; LIFO or `new_fifo`; wraparound-safe; live buffer reclamation |
+| `idempotent` | `IdempotentWorker` (WS-MULT) | **≥1×** multiplicity; `put` is a plain store (no CAS/fence) |
+| `idempotent` | `WeakStealer` (WS-WMULT) | weak multiplicity; consumer path **fully fence-free, no RMW** |
+| `idempotent` | `bounded()` + `steal_exclusive` (B-WS-MULT) | bounded multiplicity — **no two thieves take the same task** |
+| `linked` | `LinkedWorker` (approach 2) | linked-node store: **constant-time `put`, zero reclamation** |
+| `priority` | `PriorityWorker<T, K>` | K priority levels — expand promising work first |
+| `scheduler` | `run` / `run_with` | lifeline fork-join driver; locality bias + lazy work-pushing |
+
+The WS-MULT family is a Rust implementation of Castañeda & Piña's *Fully Read/Write Fence-Free
+Work-Stealing with Multiplicity* (arXiv:2008.04424), which sidesteps the Attiya et al.
+impossibility result (exact-once work-stealing *must* use a fence or CAS) by relaxing to
+multiplicity. The core `idempotent` queue is measured ~1.4× faster than the Chase-Lev `pop`/
+`push` path because it carries neither the fence nor the CAS. See
+[`research/GAPS.md`](research/GAPS.md#-breakthrough-ws-mult--fence-free-cas-free-work-stealing-srcidempotentrs).
+
+| | `Worker` (Chase-Lev) | `IdempotentWorker` (WS-MULT) |
 | --- | --- | --- |
 | Contract | every task runs **exactly once** | every task runs **≥1 times** (multiplicity ≤ #threads) |
 | `push`/`put` | store + `Release` | **plain store — no CAS, no fence** |

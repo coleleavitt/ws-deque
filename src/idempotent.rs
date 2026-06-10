@@ -397,6 +397,82 @@ impl<T: Clone> IdempotentStealer<T> {
         // SAFETY: `p` points to a live boxed task owned by the queue.
         Take::Got(unsafe { (*p).clone() })
     }
+
+    /// Convert this thief handle into a [`WeakStealer`] for the **weak-multiplicity** variant
+    /// (WS-WMULT). The weak variant is *fully fence-free on the consumer side* — it uses no
+    /// read-modify-write at all (not even `fetch_max`) — at the cost of weak FIFO ordering: a
+    /// thief may briefly observe a stale head and re-deliver a task already taken. Suitable for
+    /// the same idempotent workloads as [`steal`](Self::steal), one notch cheaper.
+    pub fn into_weak(self) -> WeakStealer<T> {
+        WeakStealer {
+            inner: self.inner,
+            r: 0,
+        }
+    }
+}
+
+/// A weak-multiplicity (WS-WMULT) thief. Implements Castañeda-Piña §4: the shared monotone
+/// `head` plus this consumer's private cached maximum `r` together form a *RangeMaxRegister*
+/// (Fig. 6). Both `RMaxRead` and `RMaxWrite` are plain reads/writes — **no CAS, no fence, no
+/// `fetch_max`** — so the entire consumer path is fence-free. The trade-off versus [`Stealer`]
+/// is weaker ordering: `head` is advanced with a plain store, so a slow thief can momentarily
+/// see an out-of-date head and re-deliver a task (still bounded multiplicity in practice).
+///
+/// Because it carries per-consumer state (`r`), `steal_weak` takes `&mut self`; clone the
+/// owner's [`IdempotentStealer`] once per thread and call [`into_weak`](IdempotentStealer::into_weak).
+pub struct WeakStealer<T> {
+    inner: Arc<Inner<T>>,
+    /// This consumer's private RangeMaxRegister component (the largest head it has observed).
+    r: usize,
+}
+
+// SAFETY: a `WeakStealer` is single-consumer (its `r` is owner-private via `&mut self`); it is
+// `Send` so it can be moved to its thread, but deliberately not `Sync`.
+unsafe impl<T: Send> Send for WeakStealer<T> {}
+
+impl<T: Clone> WeakStealer<T> {
+    /// `RMaxRead` (Fig. 6, lines 6-7): refresh the private max from the shared head and return it.
+    #[inline]
+    fn rmax_read(&mut self) -> usize {
+        let shared = self.inner.head.load(Ordering::Acquire);
+        if shared > self.r {
+            self.r = shared;
+        }
+        self.r
+    }
+
+    /// `RMaxWrite(x)` (Fig. 6, lines 1-4): publish a new head if it exceeds our known max.
+    #[inline]
+    fn rmax_write(&mut self, x: usize) {
+        let shared = self.inner.head.load(Ordering::Acquire);
+        if shared > self.r {
+            self.r = shared;
+        }
+        if x > self.r {
+            self.r = x;
+            // Plain store (no RMW): the defining fence-free move of WS-WMULT.
+            self.inner.head.store(x, Ordering::Release);
+        }
+    }
+
+    /// **Weak steal** (WS-WMULT, the WS-MULT `steal` with `Head` = RangeMaxRegister). Reads the
+    /// ranged head, reads that slot, and on success advances the head with a plain write.
+    pub fn steal_weak(&mut self) -> Take<T> {
+        let head = self.rmax_read();
+        let arr = self.inner.tasks.load(Ordering::Acquire);
+        // SAFETY: `arr` is a live array pointer.
+        let cells: &[AtomicPtr<T>] = unsafe { &(*arr).cells };
+        let p = match cells.get(head) {
+            Some(c) => c.load(Ordering::Acquire),
+            None => return Take::Empty,
+        };
+        if p.is_null() {
+            return Take::Empty;
+        }
+        self.rmax_write(head + 1);
+        // SAFETY: `p` points to a live boxed task owned by the queue.
+        Take::Got(unsafe { (*p).clone() })
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -536,6 +612,70 @@ mod tests {
             assert_eq!(
                 got, 1,
                 "task {v} taken {got} times by thieves (must be exactly 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn weak_steal_single_thief_fifo() {
+        let mut w = IdempotentWorker::<usize>::new();
+        for i in 0..10 {
+            w.put(i);
+        }
+        let mut s = w.stealer().into_weak();
+        // A single weak thief observes its own writes immediately ⇒ exact FIFO, at-least-once.
+        for i in 0..10 {
+            assert_eq!(s.steal_weak(), Take::Got(i));
+        }
+        assert_eq!(s.steal_weak(), Take::Empty);
+    }
+
+    #[test]
+    fn weak_steal_concurrent_at_least_once_bounded() {
+        let mut w = IdempotentWorker::<usize>::new();
+        let n = 100_000;
+        let thieves = 4;
+        for i in 0..n {
+            w.put(i);
+        }
+        let counts: StdArc<Vec<AtomicUsize>> =
+            StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+
+        std::thread::scope(|scope| {
+            for _ in 0..thieves {
+                let mut s = w.stealer().into_weak();
+                let counts = StdArc::clone(&counts);
+                scope.spawn(move || {
+                    // Each weak thief drains until it sees the queue exhausted from its view.
+                    let mut empties = 0;
+                    while empties < 1000 {
+                        match s.steal_weak() {
+                            Take::Got(v) => {
+                                counts[v].fetch_add(1, StdOrdering::SeqCst);
+                                empties = 0;
+                            }
+                            Take::Empty => empties += 1,
+                        }
+                    }
+                });
+            }
+            // Owner also consumes (weak multiplicity allows take+steal overlap).
+            while let Take::Got(v) = w.take() {
+                counts[v].fetch_add(1, StdOrdering::SeqCst);
+            }
+        });
+
+        // WS-WMULT contract: every task delivered AT LEAST once; multiplicity stays bounded
+        // (a weak thief may re-deliver under a stale head, but not unboundedly here).
+        for (v, c) in counts.iter().enumerate() {
+            let got = c.load(StdOrdering::SeqCst);
+            assert!(
+                got >= 1,
+                "task {v} never delivered (violates at-least-once)"
+            );
+            assert!(
+                got <= thieves + 4,
+                "task {v} delivered {got} times — multiplicity too high"
             );
         }
     }

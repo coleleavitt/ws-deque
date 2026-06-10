@@ -93,6 +93,23 @@ point). Measured ~1.4× faster owner put/take than Chase-Lev (137 µs vs 192 µs
 isolating the eliminated fence+CAS. Use for idempotent workloads (parallel SAT, graph search,
 fixpoint, branch-and-bound); use `Worker` when exactly-once is required.
 
+✅ **WS-WMULT weak multiplicity** is now implemented (`idempotent::WeakStealer`,
+`IdempotentStealer::into_weak`). Castañeda-Piña §4: the shared monotone `head` plus each
+consumer's private cached max `r` form a *RangeMaxRegister* (Fig. 6) whose `RMaxRead`/`RMaxWrite`
+are plain reads/writes — so the **entire consumer path is fence-free, with no `fetch_max` / no
+RMW at all** (one notch cheaper than WS-MULT's `fetch_max`). The trade-off is weaker FIFO
+ordering (a thief may briefly observe a stale head). Per-consumer state means `steal_weak` takes
+`&mut self`. Tested (single-thief FIFO + concurrent at-least-once/bounded), TSan-clean.
+
+✅ **Linked-list array backing** (Castañeda-Piña *approach 2*) is now implemented as the
+`linked` module (`LinkedWorker`/`LinkedStealer`). The task store is a singly-linked list of
+fixed-size nodes indexed by `(node, offset)`, giving two properties the contiguous deque can't
+have together: **`put` is true constant-time** (link a fresh node instead of doubling+copying)
+and **no reclamation problem at all** (nodes are append-only and never abandoned — no epoch GC,
+no quiescent counter, no retired list). Same multiplicity semantics. Tested (FIFO across many
+nodes, constant-time growth, concurrent at-least-once), TSan-clean. Trade-off: pointer-chasing
+slot access vs. the contiguous deque's `& mask`.
+
 ✅ **B-WS-MULT bounded-multiplicity steal** is now implemented:
 `IdempotentWorker::bounded(capacity)` + `IdempotentStealer::steal_exclusive()`. A thief claims
 the head slot with a single `false→true` CAS on a per-slot flag, so **no two thieves ever take
@@ -103,9 +120,8 @@ returns `false` when full rather than growing. (This soundness boundary was caug
 advisor — a growable claim scheme lets a thief on a retired array and one on the grown array
 both claim the same logical slot.) Tested with a 6-thief no-double-take stress, TSan-clean.
 
-⬜ Still deferred from this paper: the linked-list array backing (paper's approach 2, better
-under heavy growth — we use approach 1, doubling); the weak-multiplicity FIFO variant
-(WS-WMULT).
+All variants from this paper are now implemented (WS-MULT, B-WS-MULT, WS-WMULT, and both array
+backings — contiguous in `idempotent`, linked-list in `linked`).
 
 ## Chase & Lev, *Dynamic Circular Work-Stealing Deque* (SPAA'05) — the core paper
 
@@ -138,8 +154,8 @@ under heavy growth — we use approach 1, doubling); the weak-multiplicity FIFO 
 | Mechanism | Status | Notes |
 | --- | --- | --- |
 | **Locality-biased steals** (bias victim choice to same-socket) | ✅ | `scheduler::run_with(workers, group_size, …)`: workers split into contiguous locality groups; an idle thief biases ~half its random-victim probes to its own group before going global. Correctness-preserving (irregular tree + parallel sum complete under bias), TSan-clean + 15× stress-looped. (Behavioural locality *win* is workload/hardware-dependent and not asserted.) |
-| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ⬜ | The lifeline scheduler's pull-based stealing covers load balancing; explicit push-to-buddy deferred. |
-| Locality-hint API | ⬜ | Per-task hints deferred; group-level bias (above) covers the common NUMA case. |
+| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ✅ | `Spawner::spawn_at(task, worker)` deposits into the target worker's MPSC inbox; the target drains it into its own deque at the loop top (preserving the single-owner invariant). Cost lands on the rare hint path. A **lost-wakeup hang** here (a worker parking while its inbox held work) was caught by the parallel-sum test and fixed by re-checking the inbox under the park lock before sleeping. TSan-clean + 15× stress. |
+| Locality-hint API | ✅ | `Spawner::spawn_at` is the per-task hint; group-level bias (`run_with`) covers coarse NUMA placement. |
 | Work-first principle (cost on the steal, not the work, path) | ✅ | Honored: owner push/pop take no CAS on the common path; only steals and last-element pops CAS. |
 
 ## Production-deque features (industry practice, beyond the papers)
