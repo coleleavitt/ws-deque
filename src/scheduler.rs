@@ -83,7 +83,7 @@ struct Shared<T> {
     steal_attempts: AtomicUsize,
 }
 
-/// Scheduling statistics returned by [`run_collect_stats`], for the Acar-style work-inflation
+/// Scheduling statistics returned by [`run_with_config`], for the Acar-style work-inflation
 /// decomposition (separating load-balancing cost from the actual computation).
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {

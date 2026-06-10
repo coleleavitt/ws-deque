@@ -207,11 +207,54 @@ fn bench_contended(c: &mut Criterion) {
     group.finish();
 }
 
+/// The *realistic* job-queue case: the payload is an already-heap-allocated task
+/// (`Box<dyn FnOnce()>`), as in any real executor (Rayon/Tokio enqueue boxed closures). Here
+/// **both** deques pay one allocation per task regardless of internal storage, so ws-deque's
+/// extra `AtomicPtr` box is amortized against work that was going to allocate anyway — the two
+/// implementations should converge. This is the workload that matters for an executor, vs. the
+/// `u64`-payload microbench above which maximizes the relative storage overhead.
+fn bench_task_queue(c: &mut Criterion) {
+    type Task = Box<dyn FnOnce() -> u64 + Send>;
+    let mut group = c.benchmark_group("task_queue_boxed");
+    let n = 2048usize;
+
+    group.bench_function("ws_deque", |b| {
+        let w = Worker::<Task>::new();
+        b.iter(|| {
+            for i in 0..n as u64 {
+                w.push(Box::new(move || i.wrapping_mul(2654435761)));
+            }
+            let mut sum = 0u64;
+            while let Some(task) = w.pop() {
+                sum = sum.wrapping_add(task());
+            }
+            black_box(sum);
+        });
+    });
+
+    group.bench_function("crossbeam", |b| {
+        let w = CbWorker::<Task>::new_lifo();
+        b.iter(|| {
+            for i in 0..n as u64 {
+                w.push(Box::new(move || i.wrapping_mul(2654435761)));
+            }
+            let mut sum = 0u64;
+            while let Some(task) = w.pop() {
+                sum = sum.wrapping_add(task());
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_push_pop,
     bench_contended,
     bench_fencefree_put_take,
-    bench_inline_vs_boxed
+    bench_inline_vs_boxed,
+    bench_task_queue
 );
 criterion_main!(benches);

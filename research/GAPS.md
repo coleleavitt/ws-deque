@@ -222,19 +222,21 @@ its phase wrapper), so UB-detection (provenance/alignment/uninit) is presently v
 
 ### Benchmark reality (this machine, `cargo bench`, N=4096)
 
-| Workload | ws-deque (boxed) | **ws-deque (inline `Copy`)** | crossbeam |
+| Workload (`cargo bench`) | ws-deque (boxed) | ws-deque (inline `Copy`) | crossbeam |
 | --- | ---: | ---: | ---: |
-| push/pop (uncontended) | ~169 µs | **~47 µs** | ~32 µs |
-| owner vs 3 thieves | ~1.97 ms | — | ~277 µs |
+| `push_pop` of `u64` | ~169 µs | **~47 µs** | ~32 µs |
+| `owner_vs_thieves` (u64) | ~1.97 ms | — | ~277 µs |
+| **`task_queue_boxed`** (`Box<dyn FnOnce>` jobs) | **~77 µs** | n/a | ~83 µs |
 
-**The boxing was the whole gap, and the `inline` module closes it.** The general `Worker` boxes
-every element into an `AtomicPtr<T>` cell so it is *genuinely* race-free for arbitrary `T` (TSan-
-and loom-clean), at the cost of an allocation per `push`. crossbeam stores elements inline via
-`read_volatile`/`write_volatile`, which it documents as "technically a data race and therefore
-UB" — faster, but TSan flags it. The **`inline::InlineWorker<T: Copy>`** fast path stores small
-`Copy` values directly in `AtomicU64` cells: no allocation, no pointer-chase, and still race-free
-(a `Copy` value has no `Drop`, so a racing read is just a harmless bit-copy). Result: **3.6×
-faster than the boxed deque (47µs vs 169µs)**, within ~1.5× of crossbeam — without the UB.
+**Two honest stories, by payload.** (1) On a `u64` microbench the general `Worker`'s per-element
+`AtomicPtr` box (an allocation crossbeam avoids via inline-but-technically-UB `volatile`) makes it
+~5× slower — and the **`inline::InlineWorker<T: Copy>`** fast path closes that to ~1.5× by storing
+small `Copy` values directly in `AtomicU64` cells (no alloc, still race-free since `Copy` has no
+`Drop`). (2) But the `u64` case *maximizes* relative storage overhead and is **not** how executors
+work. The realistic `task_queue_boxed` row uses `Box<dyn FnOnce>` jobs (what Rayon/Tokio actually
+enqueue): there both deques pay the same per-task allocation, so ws-deque's box amortizes and the
+two **converge to parity** (~77 µs vs ~83 µs). So: `inline` for small `Copy` payloads, default
+`Worker` for task queues where it's already competitive *and* genuinely race-free (no UB).
 
 ## Additional literature pulled
 
@@ -301,7 +303,9 @@ single-retirer setting does not need their generality):
   the `persistent` module: an explicit NVM persistency model (`pwb`/`psync`, simulated since no
   NVRAM hardware) with crash + recovery. Durably-enqueued items survive a crash at *any* point;
   un-`psync`'d ones are correctly lost; no duplicates/resurrection. 5 tests incl. crash-at-every-
-  point consistency.
+  point consistency. **WARNING: durability is simulated in RAM, not real** — no NVRAM hardware
+  here, so "NVM" is a `Vec`, "crash" is a method call, and nothing survives a real process exit.
+  Models/tests the *algorithm*, not production durability (use a WAL/`fsync`/NVM library).
 
 **Read, deferred (genuinely different scope):**
 - Motiwala, *No Cords Attached: Coordination-Free Concurrent Lock-Free Queues*

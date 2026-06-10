@@ -111,7 +111,7 @@ A family of work-stealing structures, plus a scheduler that ties them together:
 | `scheduler` | `run` / `run_with` / `run_with_config` | lifeline fork-join driver; locality bias, lazy work-pushing, **heartbeat granularity control** |
 | `distributed` | `run` (shared-nothing nodes) | message-passing distributed work-stealing — steal requests, half victim policy |
 | `race` | `Dag` / `detect_races` | DePa **determinacy-race detection** (SP-order) — schedule-independent |
-| `persistent` | `PersistentQueue` | crash-recoverable NVM FIFO — `pwb`/`psync` model + recovery |
+| `persistent` | `PersistentQueue` | NVM FIFO persistency model — `pwb`/`psync` + recovery. **⚠️ simulated, not real durability** |
 
 **Verification:** every concurrent module is checked by both **loom** (exhaustive interleaving
 model-checking of bounded scenarios) and **ThreadSanitizer** (full test suite), run on every push
@@ -157,11 +157,23 @@ assert!(matches!(s.steal(), Take::Got(2)));
   `RUSTFLAGS="--cfg loom" cargo test --release loom_`.
 - **ThreadSanitizer** runs clean across every concurrent test and the `fib` example:
   `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --lib -Zbuild-std --target <triple>`.
-- **`cargo bench`** pits this crate against `crossbeam-deque`. The honest trade-off: boxing
-  each element into an `AtomicPtr` cell costs ~3.5× on push/pop and ~7× under contention
-  versus crossbeam's inline-but-technically-UB `volatile` storage — the price of being
-  *genuinely* race-free. For a job queue enqueuing `Box`/`Arc` tasks the allocation is largely
-  amortized. See [`research/GAPS.md`](research/GAPS.md) for the full paper-by-paper analysis.
+- **`cargo bench`** pits this crate against `crossbeam-deque`. The result depends entirely on
+  the payload:
+
+  | Workload (`cargo bench`) | ws-deque | crossbeam | Verdict |
+  | --- | ---: | ---: | --- |
+  | `push_pop` of `u64` (boxed cells) | ~169 µs | ~32 µs | crossbeam ~5× faster |
+  | `push_pop` of `u64` (**`inline` fast path**) | ~47 µs | ~32 µs | within ~1.5× |
+  | **`task_queue_boxed`** — `Box<dyn FnOnce>` jobs | **~77 µs** | ~83 µs | **converged (≈parity)** |
+
+  The `u64` microbench *maximizes* the relative cost of ws-deque's per-element `AtomicPtr` box
+  (an allocation crossbeam avoids with its inline-but-technically-UB `volatile`). But that is the
+  worst case, not the realistic one. **For any real executor the payload is already a heap
+  allocation** (`Box<dyn FnOnce>`, `Arc<Task>` — exactly what Rayon/Tokio enqueue), so both deques
+  pay the same allocation and the overhead amortizes to **parity** (the `task_queue_boxed` row).
+  Use `inline::InlineWorker<T: Copy>` for small `Copy` payloads; the default `Worker` is for
+  task/job queues where it is already competitive *and* genuinely race-free (no UB, TSan- and
+  loom-clean). See [`research/GAPS.md`](research/GAPS.md) for the full analysis.
 
 ## References
 

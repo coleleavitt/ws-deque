@@ -1,5 +1,14 @@
 //! A **crash-recoverable (persistent) FIFO queue** with an explicit persistency model.
 //!
+//! > ⚠️ **NOT REAL CRASH DURABILITY.** This is a *software simulation* of NVM persistence for
+//! > study and testing — it does **not** flush to disk or actual non-volatile memory, and it
+//! > does **not** survive a real process exit or power loss. "Crash" here means a method call
+//! > ([`PersistentQueue::crash_now`]) that wipes the modelled volatile state; "durable" means
+//! > "recorded in an in-RAM log we chose to keep across that simulated crash." Do **not** use it
+//! > anywhere you need genuine durability — use a real WAL / `fsync`'d store / NVM library for
+//! > that. It exists to demonstrate and test the *persistency algorithm* (`pwb`/`psync` ordering
+//! > and recovery correctness), nothing more.
+//!
 //! Models the durability discipline of
 //!
 //! - P. Fatourou, N. Giachoudis, G. Mallis, *Highly-Efficient Persistent FIFO Queues*,
@@ -91,6 +100,10 @@ impl Default for PersistentMemory {
 /// A durable SPSC FIFO queue backed by [`PersistentMemory`]. Each `enqueue`/`dequeue` persists a
 /// single record with one `pwb`+`psync` pair (the paper's "a pair of persistence instructions
 /// per operation"), so the durable log is always a valid linearization of completed operations.
+///
+/// > ⚠️ **Simulated durability only** — see the module-level warning. The "non-volatile memory"
+/// > is an in-RAM `Vec`; nothing is written to disk/NVM and nothing survives a real crash or
+/// > process exit. This type models the *algorithm*, not production durability.
 pub struct PersistentQueue {
     mem: PersistentMemory,
     /// Volatile (cached) live contents, reconstructable from `mem` by [`recover`](Self::recover).

@@ -5,12 +5,24 @@ edition = "2021"
 rust-version = "1.73"
 authors = ["Cole Leavitt"]
 license = "MIT OR Apache-2.0"
-description = "A lock-free, dependency-free, ThreadSanitizer-clean Chase-Lev work-stealing deque"
+description = "Lock-free, ThreadSanitizer- and loom-clean work-stealing primitives: a Chase-Lev deque, fence-free WS-MULT queues, a Jiffy MPSC injector, and a lifeline fork-join scheduler"
 repository = "https://github.com/coleleavitt/ws-deque"
+homepage = "https://github.com/coleleavitt/ws-deque"
+documentation = "https://docs.rs/ws-deque"
 readme = "README.md"
-keywords = ["work-stealing", "deque", "lock-free", "concurrency", "chase-lev"]
-categories = ["concurrency", "data-structures"]
-exclude = ["research/*.pdf"]
+keywords = ["work-stealing", "deque", "lock-free", "concurrency", "scheduler"]
+categories = ["concurrency", "data-structures", "algorithms"]
+# Keep the published crate lean: ship code, README, license, and the design synthesis docs —
+# but not the bulky research artifacts (PDFs / extracted text) or CI config.
+exclude = [
+    "research/*.pdf",
+    "research/*.txt",
+    ".github/",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "ws_deque"
@@ -20,7 +32,7 @@ path = "src/lib.rs"
 loom = "0.7"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
 
 [[example]]
 name = "fib"

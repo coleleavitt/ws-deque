@@ -355,7 +355,7 @@ impl<T: Clone> IdempotentStealer<T> {
 
     /// **Bounded-multiplicity steal** (Castañeda-Piña B-WS-MULT). Like [`steal`](Self::steal),
     /// but a thief first claims the slot with a single `false→true` CAS on a per-slot flag, so
-    /// **no two thieves ever take the same task**. (A concurrent owner [`take`] may still take
+    /// **no two thieves ever take the same task**. (A concurrent owner [`take`](IdempotentWorker::take) may still take
     /// it once — the paper's bounded variant excludes only thief/thief duplication, not
     /// take/steal.) Returns [`Take::Empty`] when the head slot is empty or already claimed.
     ///
@@ -414,7 +414,7 @@ impl<T: Clone> IdempotentStealer<T> {
 /// A weak-multiplicity (WS-WMULT) thief. Implements Castañeda-Piña §4: the shared monotone
 /// `head` plus this consumer's private cached maximum `r` together form a *RangeMaxRegister*
 /// (Fig. 6). Both `RMaxRead` and `RMaxWrite` are plain reads/writes — **no CAS, no fence, no
-/// `fetch_max`** — so the entire consumer path is fence-free. The trade-off versus [`Stealer`]
+/// `fetch_max`** — so the entire consumer path is fence-free. The trade-off versus [`IdempotentStealer`]
 /// is weaker ordering: `head` is advanced with a plain store, so a slow thief can momentarily
 /// see an out-of-date head and re-deliver a task (still bounded multiplicity in practice).
 ///
