@@ -17,11 +17,50 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_deque::{Steal as CbSteal, Worker as CbWorker};
+use ws_deque::bwos::BwosWorker;
 use ws_deque::idempotent::{IdempotentWorker, Take};
 use ws_deque::inline::InlineWorker;
 use ws_deque::{Steal, Worker};
 
 const N: usize = 4096;
+
+/// BWoS (block-based) vs crossbeam on owner push/pop. BWoS's in-block fast path is a plain slot
+/// write + `Release` bump (no fence, no CAS) until a block boundary, so it should be competitive
+/// with — or beat — crossbeam's inline volatile, while staying race-free (no UB).
+fn bench_bwos_push_pop(c: &mut Criterion) {
+    let mut group = c.benchmark_group("push_pop_bwos");
+
+    group.bench_function("ws_bwos", |b| {
+        // 64 blocks * 256 = 16384 capacity, comfortably above N so no boundary churn dominates.
+        let w = BwosWorker::<u64>::with_blocks(64, 256);
+        b.iter(|| {
+            for i in 0..N as u64 {
+                w.put(black_box(i));
+            }
+            let mut sum = 0u64;
+            while let Some(v) = w.pop() {
+                sum += v;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.bench_function("crossbeam", |b| {
+        let w = CbWorker::<u64>::new_lifo();
+        b.iter(|| {
+            for i in 0..N as u64 {
+                w.push(black_box(i));
+            }
+            let mut sum = 0u64;
+            while let Some(v) = w.pop() {
+                sum += v;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
 
 /// Boxed deque vs the inline (`Copy`) fast path vs crossbeam, on owner push/pop. Quantifies how
 /// much of the boxed deque's overhead is the per-element allocation.
@@ -255,6 +294,7 @@ criterion_group!(
     bench_contended,
     bench_fencefree_put_take,
     bench_inline_vs_boxed,
-    bench_task_queue
+    bench_task_queue,
+    bench_bwos_push_pop
 );
 criterion_main!(benches);

@@ -100,8 +100,9 @@ A family of work-stealing structures, plus a scheduler that ties them together:
 
 | Module | Type | Contract / niche |
 | --- | --- | --- |
-| (root) | `Worker` / `Stealer` (Chase-Lev) | **exact-once**; LIFO or `new_fifo`; wraparound-safe; live buffer reclamation |
-| `inline` | `InlineWorker<T: Copy>` | allocation-free fast path — **3.6× faster** push/pop than the boxed deque |
+| (root) | `Worker` / `Stealer` (Chase-Lev) | **exact-once**; LIFO or `new_fifo`; wraparound-safe; live buffer reclamation; cache-padded |
+| `bwos` | `BwosWorker` / `BwosStealer` | block-based work stealing (OSDI'23) — **~5.8× faster than crossbeam** on push/pop |
+| `inline` | `InlineWorker<T: Copy>` | allocation-free fast path — fence-light steal, no per-element box |
 | `idempotent` | `IdempotentWorker` (WS-MULT) | **≥1×** multiplicity; `put` is a plain store (no CAS/fence) |
 | `idempotent` | `WeakStealer` (WS-WMULT) | weak multiplicity; consumer path **fully fence-free, no RMW** |
 | `idempotent` | `bounded()` + `steal_exclusive` (B-WS-MULT) | bounded multiplicity — **no two thieves take the same task** |
@@ -162,18 +163,24 @@ assert!(matches!(s.steal(), Take::Got(2)));
 
   | Workload (`cargo bench`) | ws-deque | crossbeam | Verdict |
   | --- | ---: | ---: | --- |
-  | `push_pop` of `u64` (boxed cells) | ~169 µs | ~32 µs | crossbeam ~5× faster |
-  | `push_pop` of `u64` (**`inline` fast path**) | ~47 µs | ~32 µs | within ~1.5× |
+  | `push_pop` of `u64` (boxed cells) | ~154 µs | ~32 µs | crossbeam ~5× faster |
+  | `push_pop` of `u64` (**`inline` fast path**) | ~44 µs | ~32 µs | within ~1.4× |
+  | **`push_pop_bwos`** — block-based (`bwos`) | **~6.2 µs** | ~36 µs | **BWoS ~5.8× *faster*** |
   | **`task_queue_boxed`** — `Box<dyn FnOnce>` jobs | **~77 µs** | ~83 µs | **converged (≈parity)** |
 
-  The `u64` microbench *maximizes* the relative cost of ws-deque's per-element `AtomicPtr` box
-  (an allocation crossbeam avoids with its inline-but-technically-UB `volatile`). But that is the
-  worst case, not the realistic one. **For any real executor the payload is already a heap
-  allocation** (`Box<dyn FnOnce>`, `Arc<Task>` — exactly what Rayon/Tokio enqueue), so both deques
-  pay the same allocation and the overhead amortizes to **parity** (the `task_queue_boxed` row).
-  Use `inline::InlineWorker<T: Copy>` for small `Copy` payloads; the default `Worker` is for
-  task/job queues where it is already competitive *and* genuinely race-free (no UB, TSan- and
-  loom-clean). See [`research/GAPS.md`](research/GAPS.md) for the full analysis.
+  Two takeaways. **(1) The `bwos` block-based queue beats crossbeam outright** (~5.8×): splitting
+  the queue into blocks moves the owner's `push`/`pop` off the contended shared indices, so the
+  in-block fast path is a plain write + `Release` bump — no `SeqCst` fence per op, which is what
+  Chase-Lev (ours *and* crossbeam's) pays. This is the OSDI'23 BWoS result, reproduced and
+  loom/TSan-verified. **(2) For the classic Chase-Lev deque, payload decides the story:** the
+  `u64` microbench *maximizes* the relative cost of ws-deque's per-element `AtomicPtr` box (an
+  allocation crossbeam avoids with inline-but-technically-UB `volatile`), but for any real
+  executor the payload is already a heap allocation (`Box<dyn FnOnce>`/`Arc<Task>` — what
+  Rayon/Tokio enqueue), so both converge to **parity** (`task_queue_boxed`). Per-field
+  `CachePadded` (dependency-free) removes owner↔thief false sharing, cutting the contended deque
+  ~20%. Pick: **`bwos`** for raw throughput, **`inline`** for small `Copy` payloads, default
+  **`Worker`** for task queues — all genuinely race-free (no UB, TSan- and loom-clean). See
+  [`research/GAPS.md`](research/GAPS.md) for the full analysis.
 
 ## References
 

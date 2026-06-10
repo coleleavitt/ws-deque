@@ -26,7 +26,7 @@ use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, Ordering, fence};
 
-pub use crate::Steal;
+pub use crate::{CachePadded, Steal};
 
 const MIN_CAPACITY: usize = 16;
 const SHRINK_FACTOR: usize = 3;
@@ -112,23 +112,28 @@ struct Retired {
 }
 
 struct Inner {
-    bottom: AtomicIsize,
-    top: AtomicIsize,
+    /// Owner-written (and thief-read). Cache-padded so writes don't invalidate the thieves'
+    /// `top` line — the dominant false-sharing cost in the steal hot loop.
+    bottom: CachePadded<AtomicIsize>,
+    /// Thief-CAS'd (and owner-read). On its own cache line, away from `bottom`.
+    top: CachePadded<AtomicIsize>,
     buffer: AtomicPtr<Buffer>,
+    /// Retired (grown/shrunk-out) buffers. The inline deque uses **retain-until-drop**
+    /// reclamation — retired buffers are kept (memory bounded by `O(log max_len)` arrays) and
+    /// freed only when the whole deque drops. This lets `steal` skip the `in_flight` counter
+    /// (two `SeqCst` RMWs) the boxed deque needs, trading a little memory for a faster steal
+    /// hot path. Sound because a thief can never read freed memory: nothing is freed mid-life.
     retired: AtomicPtr<Retired>,
-    /// In-flight steals, for quiescent-state buffer reclamation (see the main deque).
-    in_flight: AtomicIsize,
 }
 
 impl Inner {
     fn new(log_cap: u32) -> Self {
         let buffer = Box::into_raw(Box::new(Buffer::alloc(1usize << log_cap)));
         Inner {
-            bottom: AtomicIsize::new(0),
-            top: AtomicIsize::new(0),
+            bottom: CachePadded(AtomicIsize::new(0)),
+            top: CachePadded(AtomicIsize::new(0)),
             buffer: AtomicPtr::new(buffer),
             retired: AtomicPtr::new(core::ptr::null_mut()),
-            in_flight: AtomicIsize::new(0),
         }
     }
 
@@ -147,19 +152,6 @@ impl Inner {
             {
                 break;
             }
-        }
-    }
-
-    unsafe fn try_reclaim(&self) {
-        fence(Ordering::SeqCst);
-        if self.in_flight.load(Ordering::SeqCst) != 0 {
-            return;
-        }
-        let mut node = self.retired.swap(core::ptr::null_mut(), Ordering::Acquire);
-        while !node.is_null() {
-            let owned = Box::from_raw(node);
-            drop(Box::from_raw(owned.buffer));
-            node = owned.next;
         }
     }
 }
@@ -248,7 +240,6 @@ impl<T: Copy> InlineWorker<T> {
             let bigger_ptr = Box::into_raw(Box::new(bigger));
             inner.buffer.store(bigger_ptr, Ordering::Release);
             unsafe { inner.retire(buf) };
-            unsafe { inner.try_reclaim() };
             buf = bigger_ptr;
         }
 
@@ -294,7 +285,6 @@ impl<T: Copy> InlineWorker<T> {
             let smaller_ptr = Box::into_raw(Box::new(smaller));
             inner.buffer.store(smaller_ptr, Ordering::Release);
             unsafe { inner.retire(buf) };
-            unsafe { inner.try_reclaim() };
         }
     }
 }
@@ -326,6 +316,13 @@ impl<T: Copy> Clone for InlineStealer<T> {
 
 impl<T: Copy> InlineStealer<T> {
     /// Steal a value from the top of the deque.
+    ///
+    /// The steal fast path here is **fence-light**: unlike the boxed [`crate::Worker`], the
+    /// inline deque does **not** bracket the buffer dereference with an `in_flight` counter (two
+    /// extra `SeqCst` RMWs per steal). It doesn't need to: a retired buffer is *retained* (never
+    /// freed mid-life — see [`Inner::retire`]), so a thief reading a stale buffer pointer can
+    /// never use-after-free. That removes the two atomics from every steal — the same hot-path
+    /// economy crossbeam gets from epoch GC, but dependency-free.
     pub fn steal(&self) -> Steal<T> {
         let inner = &*self.inner;
         let t = inner.top.load(Ordering::Acquire);
@@ -335,12 +332,10 @@ impl<T: Copy> InlineStealer<T> {
             return Steal::Empty;
         }
 
-        // Quiescent-reclamation critical section around the buffer deref.
-        inner.in_flight.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        // SAFETY: the loaded buffer is retained until the whole deque drops, so this read is
+        // always to live memory even if the owner grows/shrinks concurrently.
         let buf = inner.buffer.load(Ordering::Acquire);
         let bits = unsafe { (*buf).cell(t).load(Ordering::Relaxed) };
-        inner.in_flight.fetch_sub(1, Ordering::SeqCst);
 
         if inner
             .top

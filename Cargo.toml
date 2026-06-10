@@ -32,7 +32,7 @@ path = "src/lib.rs"
 loom = "0.7"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(docsrs)', 'cfg(bwos_trace)'] }
 
 [[example]]
 name = "fib"

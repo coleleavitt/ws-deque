@@ -222,21 +222,46 @@ its phase wrapper), so UB-detection (provenance/alignment/uninit) is presently v
 
 ### Benchmark reality (this machine, `cargo bench`, N=4096)
 
-| Workload (`cargo bench`) | ws-deque (boxed) | ws-deque (inline `Copy`) | crossbeam |
-| --- | ---: | ---: | ---: |
-| `push_pop` of `u64` | ~169 µs | **~47 µs** | ~32 µs |
-| `owner_vs_thieves` (u64) | ~1.97 ms | — | ~277 µs |
-| **`task_queue_boxed`** (`Box<dyn FnOnce>` jobs) | **~77 µs** | n/a | ~83 µs |
+| Workload (`cargo bench`) | ws-deque | crossbeam | verdict |
+| --- | ---: | ---: | --- |
+| **`push_pop_bwos`** — block-based (`bwos`) | **~6.2 µs** | ~36 µs | **BWoS ~5.8× faster** |
+| `push_pop` `u64` (`inline`) | ~44 µs | ~32 µs | within ~1.4× |
+| `push_pop` `u64` (boxed `Worker`) | ~154 µs | ~32 µs | crossbeam ~5× |
+| `owner_vs_thieves` (boxed, cache-padded) | ~1.55 ms | ~230 µs | (was ~1.97 ms before padding) |
+| **`task_queue_boxed`** (`Box<dyn FnOnce>`) | **~77 µs** | ~83 µs | **parity** |
 
-**Two honest stories, by payload.** (1) On a `u64` microbench the general `Worker`'s per-element
-`AtomicPtr` box (an allocation crossbeam avoids via inline-but-technically-UB `volatile`) makes it
-~5× slower — and the **`inline::InlineWorker<T: Copy>`** fast path closes that to ~1.5× by storing
-small `Copy` values directly in `AtomicU64` cells (no alloc, still race-free since `Copy` has no
-`Drop`). (2) But the `u64` case *maximizes* relative storage overhead and is **not** how executors
-work. The realistic `task_queue_boxed` row uses `Box<dyn FnOnce>` jobs (what Rayon/Tokio actually
-enqueue): there both deques pay the same per-task allocation, so ws-deque's box amortizes and the
-two **converge to parity** (~77 µs vs ~83 µs). So: `inline` for small `Copy` payloads, default
-`Worker` for task queues where it's already competitive *and* genuinely race-free (no UB).
+**How to beat crossbeam — three tiers, all measured here.**
+
+1. **BWoS block-based queue (`bwos`) — beats crossbeam ~5.8×.** Wang et al., *BWoS: Formally
+   Verified Block-based Work Stealing* (OSDI'23). Splitting the queue into fixed-size blocks moves
+   the owner's `push`/`pop` off the single contended `top`/`bottom` pair: within a block the owner
+   does a plain slot write + `Release` bump — **no `SeqCst` fence, no CAS** — which is the per-op
+   cost Chase-Lev (ours *and* crossbeam's) cannot avoid. Each block is its own Chase-Lev deque
+   (`committed`=bottom, `stolen`=top); owner and thieves only contend on the rare nearly-empty
+   block. Implemented as a bounded LIFO queue, loom-verified + ThreadSanitizer-clean. *This is the
+   design that actually wins, not just matches.*
+
+2. **`CachePadded` the shared indices — ~20% on the contended deque.** Per-field 128-byte
+   alignment (dependency-free `CachePadded`, like crossbeam's) stops the owner's `bottom` writes
+   from invalidating the thieves' `top` cache line. False sharing only bites under contention, so
+   single-thread push/pop is unchanged but `owner_vs_thieves` improved ~1.97 ms → ~1.55 ms.
+
+3. **Fence-light `inline` steal.** Dropping the `in_flight` reclamation counter (2 `SeqCst` RMWs
+   per steal) in favour of retain-until-drop reclamation removes those atomics from the steal hot
+   path — the same economy crossbeam gets from epoch GC, dependency-free.
+
+**On the classic Chase-Lev `Worker`, payload decides the story:** the `u64` microbench *maximizes*
+the relative cost of its per-element `AtomicPtr` box (an allocation crossbeam avoids via
+inline-but-technically-UB `volatile`); but for any real executor the payload is already a heap
+allocation (`Box<dyn FnOnce>`/`Arc<Task>`), so both converge to parity (`task_queue_boxed`). Pick
+`bwos` for throughput, `inline` for small `Copy` payloads, default `Worker` for task queues.
+
+### Debugging facility
+
+`src/bwos.rs` ships a zero-cost `trace!` macro (compiled out unless built with `--cfg bwos_trace`)
+that logs every put/pop/steal decision and block transition with thread ids — used to pin down the
+per-block index movements while developing the protocol. Enable with:
+`RUSTFLAGS="--cfg bwos_trace" cargo test --lib bwos -- --nocapture --test-threads=1`.
 
 ## Additional literature pulled
 

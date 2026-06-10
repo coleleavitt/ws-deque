@@ -55,6 +55,7 @@
 //! - [`idempotent`] — **WS-MULT**, a fence-free, CAS-free work-stealing queue with
 //!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
 
+pub mod bwos;
 pub mod distributed;
 pub mod idempotent;
 pub mod inline;
@@ -80,6 +81,32 @@ use std::vec::Vec;
 use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicIsize, AtomicPtr, Ordering, fence};
+
+/// A cache-line-aligned wrapper that prevents **false sharing** between the field it holds and
+/// any neighbouring field. Aligned to 128 bytes, which covers both a 64-byte cache line and the
+/// 128-byte adjacent-line prefetcher pair on modern x86 (the conservative choice `crossbeam`'s
+/// `CachePadded` also makes). Putting each contended atomic (e.g. the owner-written `bottom` vs.
+/// the thief-CAS'd `top`) in its own `CachePadded` stops the owner's and thieves' writes from
+/// invalidating each other's cache lines — the dominant cost in a work-stealing hot loop.
+///
+/// Dependency-free (no `crossbeam-utils`), keeping the crate's zero-dependency promise.
+#[repr(align(128))]
+pub struct CachePadded<T>(pub T);
+
+impl<T> core::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
 
 /// Smallest backing-buffer capacity; the deque never shrinks below this.
 const MIN_CAPACITY: usize = 16;
@@ -189,8 +216,11 @@ struct Retired<T> {
 
 /// Shared state behind both the [`Worker`] and its [`Stealer`]s.
 struct Inner<T> {
-    bottom: AtomicIsize,
-    top: AtomicIsize,
+    /// Owner-written, thief-read. Cache-padded onto its own line so the owner's `bottom` writes
+    /// don't invalidate the thieves' `top` line (false sharing is the dominant steal-loop cost).
+    bottom: CachePadded<AtomicIsize>,
+    /// Thief-CAS'd, owner-read. On its own cache line, away from `bottom`.
+    top: CachePadded<AtomicIsize>,
     /// Pointer to the current (active) `Buffer<T>`, heap-boxed for atomic swap.
     buffer: AtomicPtr<Buffer<T>>,
     /// Head of the list of retired (grown/shrunk-out) buffers awaiting reclamation. Only the
@@ -211,8 +241,8 @@ impl<T> Inner<T> {
         let cap = 1usize << log_initial_cap;
         let buffer = Box::into_raw(Box::new(Buffer::alloc(cap)));
         Inner {
-            bottom: AtomicIsize::new(0),
-            top: AtomicIsize::new(0),
+            bottom: CachePadded(AtomicIsize::new(0)),
+            top: CachePadded(AtomicIsize::new(0)),
             buffer: AtomicPtr::new(buffer),
             retired: AtomicPtr::new(ptr::null_mut()),
             in_flight: AtomicIsize::new(0),
