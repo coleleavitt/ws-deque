@@ -56,6 +56,8 @@
 //!   *multiplicity* (each task delivered ≥1 times) for idempotent workloads. See that module.
 
 pub mod idempotent;
+pub mod inline;
+pub mod jiffy;
 pub mod linked;
 pub mod priority;
 pub mod scheduler;

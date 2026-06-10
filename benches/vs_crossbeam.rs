@@ -18,9 +18,60 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use criterion::{Criterion, criterion_group, criterion_main};
 use crossbeam_deque::{Steal as CbSteal, Worker as CbWorker};
 use ws_deque::idempotent::{IdempotentWorker, Take};
+use ws_deque::inline::InlineWorker;
 use ws_deque::{Steal, Worker};
 
 const N: usize = 4096;
+
+/// Boxed deque vs the inline (`Copy`) fast path vs crossbeam, on owner push/pop. Quantifies how
+/// much of the boxed deque's overhead is the per-element allocation.
+fn bench_inline_vs_boxed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("push_pop_copy");
+
+    group.bench_function("ws_inline", |b| {
+        let w = InlineWorker::<u64>::new();
+        b.iter(|| {
+            for i in 0..N as u64 {
+                w.push(black_box(i));
+            }
+            let mut sum = 0u64;
+            while let Some(v) = w.pop() {
+                sum += v;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.bench_function("ws_boxed", |b| {
+        let w = Worker::<u64>::new();
+        b.iter(|| {
+            for i in 0..N as u64 {
+                w.push(black_box(i));
+            }
+            let mut sum = 0u64;
+            while let Some(v) = w.pop() {
+                sum += v;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.bench_function("crossbeam", |b| {
+        let w = CbWorker::<u64>::new_lifo();
+        b.iter(|| {
+            for i in 0..N as u64 {
+                w.push(black_box(i));
+            }
+            let mut sum = 0u64;
+            while let Some(v) = w.pop() {
+                sum += v;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
 
 /// Owner-only put/take throughput: the fence-free, CAS-free WS-MULT queue vs the exact-once
 /// Chase-Lev deque. WS-MULT's `put` is a plain store (no fence), so this isolates the cost of
@@ -160,6 +211,7 @@ criterion_group!(
     benches,
     bench_push_pop,
     bench_contended,
-    bench_fencefree_put_take
+    bench_fencefree_put_take,
+    bench_inline_vs_boxed
 );
 criterion_main!(benches);

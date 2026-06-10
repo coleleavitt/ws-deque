@@ -154,7 +154,7 @@ backings — contiguous in `idempotent`, linked-list in `linked`).
 | Mechanism | Status | Notes |
 | --- | --- | --- |
 | **Locality-biased steals** (bias victim choice to same-socket) | ✅ | `scheduler::run_with(workers, group_size, …)`: workers split into contiguous locality groups; an idle thief biases ~half its random-victim probes to its own group before going global. Correctness-preserving (irregular tree + parallel sum complete under bias), TSan-clean + 15× stress-looped. (Behavioural locality *win* is workload/hardware-dependent and not asserted.) |
-| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ✅ | `Spawner::spawn_at(task, worker)` deposits into the target worker's MPSC inbox; the target drains it into its own deque at the loop top (preserving the single-owner invariant). Cost lands on the rare hint path. A **lost-wakeup hang** here (a worker parking while its inbox held work) was caught by the parallel-sum test and fixed by re-checking the inbox under the park lock before sleeping. TSan-clean + 15× stress. |
+| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ✅ | `Spawner::spawn_at(task, worker)` deposits into the target worker's **lock-free Jiffy MPSC inbox** (`jiffy` module); the target (single consumer) drains it into its own deque at the loop top (preserving the single-owner invariant). Cost lands on the rare hint path. A **lost-wakeup hang** (a worker parking while its inbox held work) was caught by the parallel-sum test and fixed by re-checking the inbox before sleeping. TSan-clean + 15× stress. |
 | Locality-hint API | ✅ | `Spawner::spawn_at` is the per-task hint; group-level bias (`run_with`) covers coarse NUMA placement. |
 | Work-first principle (cost on the steal, not the work, path) | ✅ | Honored: owner push/pop take no CAS on the common path; only steals and last-element pops CAS. |
 
@@ -171,18 +171,19 @@ backings — contiguous in `idempotent`, linked-list in `linked`).
 
 ### Benchmark reality (this machine, `cargo bench`, N=4096)
 
-| Workload | ws-deque | crossbeam | Ratio |
+| Workload | ws-deque (boxed) | **ws-deque (inline `Copy`)** | crossbeam |
 | --- | ---: | ---: | ---: |
-| push/pop (uncontended) | ~119 µs | ~34 µs | ~3.5× slower |
-| owner vs 3 thieves | ~1.97 ms | ~277 µs | ~7× slower |
+| push/pop (uncontended) | ~169 µs | **~47 µs** | ~32 µs |
+| owner vs 3 thieves | ~1.97 ms | — | ~277 µs |
 
-**Why, and the trade-off:** `ws-deque` boxes every element into an `AtomicPtr<T>` cell, so
-each `push` allocates and the steal path chases a pointer. That is the price of being
-*genuinely* race-free (TSan- and loom-clean). `crossbeam-deque` stores elements inline using
+**The boxing was the whole gap, and the `inline` module closes it.** The general `Worker` boxes
+every element into an `AtomicPtr<T>` cell so it is *genuinely* race-free for arbitrary `T` (TSan-
+and loom-clean), at the cost of an allocation per `push`. crossbeam stores elements inline via
 `read_volatile`/`write_volatile`, which it documents as "technically a data race and therefore
-UB" — faster, but TSan flags it. For a job queue that enqueues `Box`/`Arc` tasks anyway (the
-common case), the extra allocation is largely amortized. Closing the gap for `T: Copy` /
-small-value payloads (an inline atomic-cell fast path) is the obvious next optimization.
+UB" — faster, but TSan flags it. The **`inline::InlineWorker<T: Copy>`** fast path stores small
+`Copy` values directly in `AtomicU64` cells: no allocation, no pointer-chase, and still race-free
+(a `Copy` value has no `Drop`, so a racing read is just a harmless bit-copy). Result: **3.6×
+faster than the boxed deque (47µs vs 169µs)**, within ~1.5× of crossbeam — without the UB.
 
 ## Additional literature pulled
 
@@ -210,10 +211,14 @@ single-retirer setting does not need their generality):
 **Read, deferred (queue building blocks for a scheduler's global injector):**
 - Nikolaev & Ravindran, *wCQ: A Fast Wait-Free Queue with Bounded Memory Usage*
   (arXiv 2201.02179) — wait-free MPMC FIFO with bounded memory; the strongest candidate if
-  the scheduler grows a shared global injector queue. Deferred: heavier than needed while
-  per-worker deques + lifelines suffice.
-- Adas & Friedman, *Jiffy: Wait-Free Multi-Producer Single-Consumer Queue* (arXiv 2010.14189)
-  — MPSC; fits a single-consumer aggregation/result channel.
+  the scheduler grows a *shared global* (multi-consumer) injector. Deferred: the per-worker
+  Jiffy MPSC inboxes + lifelines suffice for the current pull-based design.
+- ✅ Adas & Friedman, *Jiffy: Wait-Free Multi-Producer Single-Consumer Queue* (arXiv 2010.14189)
+  — **implemented** as the `jiffy` module (FAA-claimed slots, 3-state slots, eager next-buffer
+  linking, single-consumer dequeue) and wired in as the scheduler's lock-free work-pushing
+  inbox, replacing the old `Mutex<Vec>`. A TSan-caught buffer use-after-free (freeing a head
+  buffer mid-`dequeue` while a slow producer still referenced it) was fixed with retain-until-
+  drop reclamation. Many-producer/one-consumer no-loss/no-dup + drop tests, TSan-clean.
 - von Geijer & Tsigas, *How to Relax Instantly: Elastic Relaxation of Concurrent Data
   Structures* (arXiv 2403.13644) and Rukundo, Atalar & Tsigas, *Relaxing Concurrent
   Data-structure Semantics … 2D Framework* (arXiv 1906.07105) — tunable semantic relaxation

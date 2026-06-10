@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::vec::Vec;
 
+use crate::jiffy::{self, Consumer, Producer};
 use crate::{Steal, Stealer, Worker};
 
 /// Per-worker shared state. The deque is owner-private (only the owning thread pushes/pops),
@@ -44,11 +45,12 @@ struct WorkerSlot<T> {
     /// Guarded by a plain mutex — touched only off the hot path (when a worker goes idle or
     /// when an owner with fresh work flushes pending lifeline requests).
     lifeline_requests: Mutex<Vec<usize>>,
-    /// **Lazy work-pushing inbox** (Deters NUMA-WS *work pushing*). Any worker may deposit a
-    /// task here to honor a locality hint (`Spawner::spawn_at`); the owning worker drains it
-    /// into its own deque at the top of its loop, preserving the single-owner deque invariant.
-    /// A plain mutex-guarded `Vec` is an MPSC queue good enough for the off-hot-path hint flow.
-    inbox: Mutex<Vec<T>>,
+    /// **Lazy work-pushing inbox** (Deters NUMA-WS *work pushing*) — the producer side of a
+    /// lock-free Jiffy MPSC queue. Any worker may `enqueue` a locality-hinted task here
+    /// (`Spawner::spawn_at`); the owning worker is the single consumer that drains it into its
+    /// own deque at the top of its loop, preserving the single-owner deque invariant. Replaces
+    /// the previous `Mutex<Vec>` inbox with a wait-free injector.
+    inbox: Producer<T>,
 }
 
 /// Shared scheduler state across all worker threads.
@@ -122,9 +124,8 @@ impl<'a, T: Send> Spawner<'a, T> {
             return self.spawn(task);
         }
         self.shared.outstanding.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut inbox) = self.shared.slots[target].inbox.lock() {
-            inbox.push(task);
-        }
+        // Wait-free enqueue into the target's Jiffy inbox (we are one of its producers).
+        self.shared.slots[target].inbox.enqueue(task);
         // The target may be parked; wake everyone so it drains its inbox.
         signal_work(self.shared);
     }
@@ -176,14 +177,20 @@ pub fn run_with<T, F>(
     let workers = workers.max(1);
     let group_size = group_size.clamp(1, workers);
 
-    // Build one deque per worker; collect stealers up front.
+    // Build one deque per worker; collect stealers up front. Each worker also gets a Jiffy MPSC
+    // inbox: the producer lives in the shared slot, the single consumer is moved into the thread.
     let deques: Vec<Worker<T>> = (0..workers).map(|_| Worker::new()).collect();
+    let mut consumers: Vec<Consumer<T>> = Vec::with_capacity(workers);
     let slots: Vec<WorkerSlot<T>> = deques
         .iter()
-        .map(|d| WorkerSlot {
-            stealer: d.stealer(),
-            lifeline_requests: Mutex::new(Vec::new()),
-            inbox: Mutex::new(Vec::new()),
+        .map(|d| {
+            let (producer, consumer) = jiffy::channel();
+            consumers.push(consumer);
+            WorkerSlot {
+                stealer: d.stealer(),
+                lifeline_requests: Mutex::new(Vec::new()),
+                inbox: producer,
+            }
         })
         .collect();
     let lifelines: Vec<Vec<usize>> = (0..workers)
@@ -217,30 +224,37 @@ pub fn run_with<T, F>(
     }
 
     std::thread::scope(|scope| {
-        // Move each owned `Worker` into its own thread (it is `Send` but not `Sync`), so the
-        // owner-private `cached_top` cell is never shared across threads.
-        for (me, deque) in deques.into_iter().enumerate() {
+        // Move each owned `Worker` and its inbox `Consumer` into its own thread (both are `Send`
+        // but not `Sync`), so owner-private state is never shared across threads.
+        for ((me, deque), consumer) in deques.into_iter().enumerate().zip(consumers) {
             let shared = Arc::clone(&shared);
             let run = &run;
-            scope.spawn(move || worker_main(me, &deque, &shared, run));
+            scope.spawn(move || worker_main(me, &deque, consumer, &shared, run));
         }
     });
 }
 
 /// The per-worker main loop: drain locally, steal when empty, park when no work exists, exit at
 /// global termination.
-fn worker_main<T, F>(me: usize, deque: &Worker<T>, shared: &Shared<T>, run: &F)
-where
+fn worker_main<T, F>(
+    me: usize,
+    deque: &Worker<T>,
+    mut inbox: Consumer<T>,
+    shared: &Shared<T>,
+    run: &F,
+) where
     T: Send,
     F: Fn(T, &Spawner<'_, T>) + Sync,
 {
     let spawner = Spawner { deque, shared, me };
 
     loop {
-        // 0. Drain our lazy-work-pushing inbox into our own deque. These tasks were already
-        //    counted as outstanding in `spawn_at`; moving them to the deque doesn't change the
-        //    count. Done first so locality-hinted work runs on its requested worker.
-        drain_inbox(me, deque, shared);
+        // 0. Drain our lazy-work-pushing inbox (Jiffy MPSC consumer) into our own deque. These
+        //    tasks were already counted as outstanding in `spawn_at`; moving them to the deque
+        //    doesn't change the count. Done first so locality-hinted work runs on its worker.
+        while let Some(task) = inbox.dequeue() {
+            deque.push(task);
+        }
 
         // 1. Drain our own deque (LIFO, good locality). Each finished task decrements the
         //    global outstanding count; reaching 0 means the whole computation is done.
@@ -268,31 +282,9 @@ where
             return;
         }
         register_lifelines(me, shared);
-        if park_until_work_or_done(me, shared) {
+        if park_until_work_or_done(me, &mut inbox, shared) {
             return; // global termination observed while parked
         }
-    }
-}
-
-/// Whether worker `me`'s lazy-work-pushing inbox currently holds any task.
-fn inbox_nonempty<T>(me: usize, shared: &Shared<T>) -> bool {
-    shared.slots[me]
-        .inbox
-        .lock()
-        .map(|q| !q.is_empty())
-        .unwrap_or(false)
-}
-
-/// Move any tasks deposited in worker `me`'s lazy-work-pushing inbox into its own deque.
-/// Takes the inbox lock briefly each loop, but the inbox is only populated when `spawn_at`
-/// locality hints are in play; with no hints it is always empty and this is near-free.
-fn drain_inbox<T: Send>(me: usize, deque: &Worker<T>, shared: &Shared<T>) {
-    let drained: Vec<T> = match shared.slots[me].inbox.lock() {
-        Ok(mut inbox) if !inbox.is_empty() => core::mem::take(&mut *inbox),
-        _ => return,
-    };
-    for task in drained {
-        deque.push(task); // already counted as outstanding by spawn_at
     }
 }
 
@@ -377,7 +369,11 @@ fn register_lifelines<T>(me: usize, shared: &Shared<T>) {
 /// A `generation` snapshot taken before sleeping closes the lost-wake race: if a buddy
 /// published work between our failed steal and acquiring the lock, the generation already
 /// differs and we don't sleep.
-fn park_until_work_or_done<T>(me: usize, shared: &Shared<T>) -> bool {
+fn park_until_work_or_done<T: Send>(
+    _me: usize,
+    inbox: &mut Consumer<T>,
+    shared: &Shared<T>,
+) -> bool {
     let st = match shared.park.lock() {
         Ok(g) => g,
         Err(_) => return true, // poisoned: treat as terminated to avoid a hang
@@ -393,7 +389,7 @@ fn park_until_work_or_done<T>(me: usize, shared: &Shared<T>) -> bool {
     // generation) *before* we snapshot `gen` below — without this check we'd sleep on a future
     // generation change while a task already sits in our inbox (a lost-wakeup hang). Returning
     // here sends us back to the loop top, which drains the inbox.
-    if inbox_nonempty(me, shared) {
+    if !inbox.is_empty() {
         return false;
     }
     let gen = st.generation;
