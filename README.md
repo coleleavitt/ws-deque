@@ -159,6 +159,11 @@ assert!(matches!(s.steal(), Take::Got(2)));
   `RUSTFLAGS="--cfg loom" cargo test --release loom_`.
 - **ThreadSanitizer** runs clean across every concurrent test and the `fib` example:
   `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --lib -Zbuild-std --target <triple>`.
+- **`crossbeam-deque`'s own test suite, ported** (`tests/crossbeam_{lifo,fifo,steal}.rs`): the
+  production crate's battle-tested stress tests — `smoke`, `spsc`, `stampede`, `stress`,
+  `no_starvation`, and the exact-once `destructors` test — run against this crate's deque (8
+  threads × 50k items), both natively and under ThreadSanitizer. This is the "is it really
+  production-hardened?" check, borrowed from the crate everyone trusts.
 - **`cargo bench`** pits this crate against `crossbeam-deque`. The result depends entirely on
   the payload:
 

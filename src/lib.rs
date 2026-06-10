@@ -134,6 +134,22 @@ impl<T> Steal<T> {
             _ => None,
         }
     }
+
+    /// Whether this outcome is [`Steal::Empty`] (no work was available).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Steal::Empty)
+    }
+
+    /// Whether this outcome is [`Steal::Success`] (a value was stolen).
+    pub fn is_success(&self) -> bool {
+        matches!(self, Steal::Success(_))
+    }
+
+    /// Whether this outcome is [`Steal::Retry`] (lost a race; the caller should try again).
+    /// Mirrors `crossbeam_deque::Steal::is_retry`, so retry-loops port directly.
+    pub fn is_retry(&self) -> bool {
+        matches!(self, Steal::Retry)
+    }
 }
 
 /// A power-of-two-sized cyclic buffer of atomic cells. Each cell holds a `*mut T` that
@@ -633,6 +649,53 @@ impl<T> Stealer<T> {
     /// Attempt to steal a value from the top of the deque.
     pub fn steal(&self) -> Steal<T> {
         steal_from(&self.inner)
+    }
+
+    /// Whether the victim deque appears empty (approximate under concurrency). Mirrors
+    /// `crossbeam_deque::Stealer::is_empty`.
+    pub fn is_empty(&self) -> bool {
+        let inner = &*self.inner;
+        let t = inner.top.load(Ordering::Acquire);
+        fence(Ordering::SeqCst);
+        let b = inner.bottom.load(Ordering::Acquire);
+        b.wrapping_sub(t) <= 0
+    }
+
+    /// Steal roughly half the victim's elements into `dest` **without** returning one directly.
+    /// Returns [`Steal::Success`]`(())` if at least one element was moved, [`Steal::Empty`] if the
+    /// victim was empty, or [`Steal::Retry`] on contention. Mirrors
+    /// `crossbeam_deque::Stealer::steal_batch`.
+    pub fn steal_batch(&self, dest: &Worker<T>) -> Steal<()> {
+        let inner = &*self.inner;
+        let t = inner.top.load(Ordering::Acquire);
+        fence(Ordering::SeqCst);
+        let b = inner.bottom.load(Ordering::Acquire);
+        let available = b.wrapping_sub(t);
+        if available <= 0 {
+            return Steal::Empty;
+        }
+        let want = ((available + 1) / 2) as usize; // ceil(half), at least 1
+        let mut moved = 0usize;
+        for _ in 0..want {
+            match self.steal() {
+                Steal::Success(v) => {
+                    dest.push(v);
+                    moved += 1;
+                }
+                Steal::Empty => break,
+                Steal::Retry => {
+                    if moved == 0 {
+                        return Steal::Retry; // nothing moved yet; let caller retry
+                    }
+                    break; // already moved some; good enough for one batch
+                }
+            }
+        }
+        if moved == 0 {
+            Steal::Empty
+        } else {
+            Steal::Success(())
+        }
     }
 
     /// Steal roughly **half** of the victim's elements, moving them into `dest`'s deque, and
