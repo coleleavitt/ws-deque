@@ -60,6 +60,10 @@ struct Shared<T> {
     park: Mutex<ParkState>,
     wake: Condvar,
     n: usize,
+    /// Workers per locality group for **locality-biased stealing** (Deters NUMA-WS). A thief
+    /// prefers victims in its own group (contiguous worker-id ranges, a proxy for same-socket)
+    /// before probing remote groups, cutting cross-NUMA traffic. `1` disables the bias.
+    group_size: usize,
 }
 
 struct ParkState {
@@ -129,7 +133,25 @@ where
     T: Send,
     F: Fn(T, &Spawner<'_, T>) + Sync,
 {
+    // Default: a single locality group (no bias).
+    run_with(workers, 1, initial, run);
+}
+
+/// Like [`run`], but with **locality-biased stealing** (Deters NUMA-WS): workers are split
+/// into contiguous groups of `group_size` (a proxy for sockets/NUMA nodes), and an idle worker
+/// prefers stealing from victims in its own group before probing remote groups. `group_size`
+/// of `0` or `1` disables the bias (identical to [`run`]).
+pub fn run_with<T, F>(
+    workers: usize,
+    group_size: usize,
+    initial: impl IntoIterator<Item = T>,
+    run: F,
+) where
+    T: Send,
+    F: Fn(T, &Spawner<'_, T>) + Sync,
+{
     let workers = workers.max(1);
+    let group_size = group_size.clamp(1, workers);
 
     // Build one deque per worker; collect stealers up front.
     let deques: Vec<Worker<T>> = (0..workers).map(|_| Worker::new()).collect();
@@ -154,6 +176,7 @@ where
         }),
         wake: Condvar::new(),
         n: workers,
+        group_size,
     });
 
     // Seed the initial tasks round-robin across worker deques, counting each as outstanding.
@@ -170,10 +193,12 @@ where
     }
 
     std::thread::scope(|scope| {
-        for (me, deque) in deques.iter().enumerate() {
+        // Move each owned `Worker` into its own thread (it is `Send` but not `Sync`), so the
+        // owner-private `cached_top` cell is never shared across threads.
+        for (me, deque) in deques.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let run = &run;
-            scope.spawn(move || worker_main(me, deque, &shared, run));
+            scope.spawn(move || worker_main(me, &deque, &shared, run));
         }
     });
 }
@@ -241,12 +266,22 @@ fn try_steal<T: Send>(me: usize, deque: &Worker<T>, shared: &Shared<T>) -> Optio
     if n <= 1 {
         return None;
     }
-    // Round 1: w random victims (w = log2(n).max(1) is a reasonable default).
+    // Round 1: w random victims (w = log2(n).max(1) is a reasonable default), biased to our
+    // own locality group when `group_size > 1`.
     let w = (usize::BITS - (n as u32).leading_zeros()).max(1) as usize;
     let mut rng = seed_rng(me);
-    for _ in 0..w {
+    let gsize = shared.group_size;
+    let group_lo = (me / gsize) * gsize;
+    let group_hi = (group_lo + gsize).min(n);
+    let group_span = group_hi - group_lo;
+    for k in 0..w {
         rng = xorshift(rng);
-        let victim = (rng as usize) % n;
+        // Bias the first ~half of attempts to same-group victims (locality), the rest globally.
+        let victim = if gsize > 1 && group_span > 1 && k < w.div_ceil(2) {
+            group_lo + (rng as usize) % group_span
+        } else {
+            (rng as usize) % n
+        };
         if victim != me {
             if let Some(t) = steal_one(shared, victim, me, deque) {
                 return Some(t);
@@ -385,5 +420,32 @@ mod tests {
             }
         });
         assert_eq!(counter.load(Ordering::Relaxed), 11);
+    }
+
+    #[test]
+    fn locality_biased_run_completes_irregular_tree() {
+        // Same irregular tree as the default scheduler, but with locality groups of 2 — the
+        // bias must not change correctness: every node expanded exactly once, clean termination.
+        let depth = 17u32;
+        let counter = AtomicUsize::new(0);
+        run_with(8, 2, [depth], |v: u32, sp| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            if v > 0 {
+                sp.spawn(v - 1);
+                sp.spawn(v - 1);
+            }
+        });
+        let expected = (1usize << (depth + 1)) - 1;
+        assert_eq!(counter.load(Ordering::Relaxed), expected);
+    }
+
+    #[test]
+    fn locality_biased_parallel_sum() {
+        let n = 200_000u64;
+        let total = AtomicU64::new(0);
+        run_with(8, 4, 0..n, |i: u64, _sp| {
+            total.fetch_add(i, Ordering::Relaxed);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), n * (n - 1) / 2);
     }
 }

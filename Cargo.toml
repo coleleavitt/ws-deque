@@ -2,7 +2,7 @@
 name = "ws-deque"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.66"
+rust-version = "1.73"
 authors = ["Cole Leavitt"]
 license = "MIT OR Apache-2.0"
 description = "A lock-free, dependency-free, ThreadSanitizer-clean Chase-Lev work-stealing deque"

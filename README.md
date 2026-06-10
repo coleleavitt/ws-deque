@@ -78,14 +78,18 @@ a `SeqCst` fence. The result is **race-free by construction** — `cargo +nightl
 ## Design
 
 - **Single owner, many thieves.** `Worker` pushes/pops the bottom (no CAS on the common path);
-  `Stealer` (cheaply cloneable, `Send + Sync`) steals from the top via CAS.
-- **Monotone `top`.** `top` is only ever advanced by CAS, never decremented, so no ABA tag.
-- **Growable *and shrinking* cyclic buffer.** Doubles on overflow (Chase-Lev §2) and halves
-  when it retreats below `cap/3` (Chase-Lev §3). Retired buffers are retained until the deque
-  is dropped (a dependency-free alternative to epoch GC); retired memory is bounded by
-  `O(log max_len)` arrays.
+  `Stealer` (cheaply cloneable, `Send + Sync`) steals from the top via CAS. `Worker::new_fifo()`
+  switches the owner to oldest-first (FIFO) processing, like crossbeam/Tokio `new_fifo`.
+- **Monotone `top`.** Only ever advanced by CAS, never decremented, so no ABA tag. All index
+  arithmetic is **wraparound-safe** (`wrapping_*`), correct even past `isize::MAX`.
+- **Cached `top` on push.** The owner keeps a private lower bound of the contended `top` and only
+  reads the shared atomic when the buffer might be full (Chase-Lev §2.3).
+- **Growable *and shrinking* cyclic buffer with live reclamation.** Doubles on overflow
+  (Chase-Lev §2), halves below `cap/3` (Chase-Lev §3). Retired buffers are freed *mid-life* by a
+  **quiescent-state** scheme (an in-flight steal counter + `SeqCst` fences) — loom-verified, so
+  the memory backlog stays bounded under grow/shrink cycling, with no epoch-GC dependency.
 - **Batch stealing.** `Stealer::steal_batch_and_pop` moves ~half the victim's work into the
-  thief's own deque in a single CAS — the amortization trick Tokio, Rayon, and crossbeam use.
+  thief's own deque — the amortization trick Tokio, Rayon, and crossbeam use.
 - **Correct `Drop`.** Every boxed element is freed exactly once — verified with a
   drop-counting test (no leaks, no double-frees).
 

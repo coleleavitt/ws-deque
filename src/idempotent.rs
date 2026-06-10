@@ -41,13 +41,13 @@ use std::boxed::Box;
 #[cfg(not(loom))]
 use std::sync::Arc;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::vec::Vec;
 
 #[cfg(loom)]
 use loom::sync::Arc;
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// Initial number of task slots.
 const INITIAL_CAPACITY: usize = 16;
@@ -77,17 +77,26 @@ impl<T> Take<T> {
 /// so a slow thief still reading an old array can't use-after-free).
 struct Tasks<T> {
     cells: Box<[AtomicPtr<T>]>,
+    /// Parallel "claimed by a thief" flags, used only by the bounded-multiplicity
+    /// [`IdempotentStealer::steal_exclusive`]. A thief that wins the `false→true` CAS on
+    /// `claimed[head]` is the unique thief allowed to take that slot, so no two *thieves* take
+    /// the same task (the owner's `take` ignores these flags — a `take` and a `steal` may still
+    /// both deliver one task, which is permitted by bounded multiplicity).
+    claimed: Box<[AtomicBool]>,
     len: usize,
 }
 
 impl<T> Tasks<T> {
     fn with_len(len: usize) -> Self {
         let mut v = Vec::with_capacity(len);
+        let mut c = Vec::with_capacity(len);
         for _ in 0..len {
             v.push(AtomicPtr::new(core::ptr::null_mut()));
+            c.push(AtomicBool::new(false));
         }
         Tasks {
             cells: v.into_boxed_slice(),
+            claimed: c.into_boxed_slice(),
             len,
         }
     }
@@ -97,10 +106,15 @@ struct Inner<T> {
     /// MaxRegister `head`: the index of the next task to take. Only ever moves forward.
     /// `fetch_max` realizes `MaxWrite`; `load` realizes `MaxRead`.
     head: AtomicUsize,
-    /// Pointer to the active `Tasks<T>` array (swapped on growth).
+    /// Pointer to the active `Tasks<T>` array (swapped on growth, unless `bounded`).
     tasks: AtomicPtr<Tasks<T>>,
     /// Retired (grown-out) arrays, freed when the queue drops.
     retired: AtomicPtr<Retired<T>>,
+    /// When `true` the array never grows (fixed capacity). Required for the bounded-
+    /// multiplicity [`IdempotentStealer::steal_exclusive`]: per-slot claim flags can only be
+    /// race-free when there is exactly **one** array for the queue's lifetime — otherwise a
+    /// thief on a retired array and a thief on the grown array could both claim the same slot.
+    bounded: bool,
 }
 
 struct Retired<T> {
@@ -161,22 +175,46 @@ pub struct IdempotentWorker<T> {
     inner: Arc<Inner<T>>,
     /// Persistent local tail (owner-only, never shared). Number of tasks ever put.
     tail: usize,
+    /// Max tasks accepted (only meaningful when bounded; `usize::MAX` when growable).
+    cap: usize,
 }
 
 // SAFETY: the owner handle moves between threads only as a whole; owner ops are single-thread.
 unsafe impl<T: Send> Send for IdempotentWorker<T> {}
 
 impl<T: Clone> IdempotentWorker<T> {
-    /// Create an empty WS-MULT queue.
+    /// Create an empty, growable WS-MULT queue. Use [`steal`](IdempotentStealer::steal) /
+    /// [`take`](Self::take) (unbounded multiplicity).
     pub fn new() -> Self {
-        let tasks = Box::into_raw(Box::new(Tasks::with_len(INITIAL_CAPACITY)));
+        Self::make(
+            INITIAL_CAPACITY.next_power_of_two().max(INITIAL_CAPACITY),
+            false,
+        )
+    }
+
+    /// Create a **bounded** (fixed-capacity) WS-MULT queue holding up to `capacity` tasks. The
+    /// array never grows, which is what makes [`steal_exclusive`](IdempotentStealer::steal_exclusive)
+    /// race-free (single array for the queue's lifetime). [`put`](Self::put) returns `false`
+    /// once `capacity` tasks have been inserted.
+    pub fn bounded(capacity: usize) -> Self {
+        // +2 for the two trailing ⊥ sentinels the algorithm keeps; capacity is enforced
+        // explicitly in `put` via the `bounded`/`cap` check, not by the array length alone.
+        let mut w = Self::make(capacity + 2, true);
+        w.cap = capacity;
+        w
+    }
+
+    fn make(len: usize, bounded: bool) -> Self {
+        let tasks = Box::into_raw(Box::new(Tasks::with_len(len)));
         IdempotentWorker {
             inner: Arc::new(Inner {
                 head: AtomicUsize::new(0),
                 tasks: AtomicPtr::new(tasks),
                 retired: AtomicPtr::new(core::ptr::null_mut()),
+                bounded,
             }),
             tail: 0,
+            cap: usize::MAX,
         }
     }
 
@@ -200,9 +238,14 @@ impl<T: Clone> IdempotentWorker<T> {
     }
 
     /// **Put** a task at the tail. Fully read/write: **no CAS, no fence** on the hot path
-    /// (Castañeda-Piña Fig. 3, lines 1-2). Grows the array first if needed.
-    pub fn put(&mut self, task: T) {
+    /// (Castañeda-Piña Fig. 3, lines 1-2). A growable queue enlarges the array as needed and
+    /// always returns `true`; a [`bounded`](Self::bounded) queue returns `false` (and drops the
+    /// task) when the fixed array is full.
+    pub fn put(&mut self, task: T) -> bool {
         let inner = &*self.inner;
+        if inner.bounded && self.tail >= self.cap {
+            return false; // fixed-capacity queue is full; never grow (keeps a single array)
+        }
         let mut arr = inner.tasks.load(Ordering::Acquire);
         // Need slots for index `tail` and the trailing `⊥` sentinel at `tail + 1`.
         // SAFETY: `arr` is a live owner-installed array.
@@ -220,6 +263,7 @@ impl<T: Clone> IdempotentWorker<T> {
             (*arr).cells[self.tail + 1].store(core::ptr::null_mut(), Ordering::Relaxed);
         }
         self.tail += 1;
+        true
     }
 
     /// Grow the task array to double length, copying existing cell pointers forward.
@@ -227,6 +271,8 @@ impl<T: Clone> IdempotentWorker<T> {
         let inner = &*self.inner;
         // SAFETY: `old` is the live active array.
         let old_ref = unsafe { &*old };
+        // Growth only ever happens on a non-bounded queue, where `steal_exclusive` (the sole
+        // user of the `claimed` flags) is forbidden — so only the task pointers need copying.
         let bigger = Tasks::with_len(old_ref.len * 2);
         for i in 0..old_ref.len {
             let p = old_ref.cells[i].load(Ordering::Relaxed);
@@ -300,6 +346,51 @@ impl<T: Clone> IdempotentStealer<T> {
             None => return Take::Empty, // head beyond a stale array view; nothing to steal
         };
         if p.is_null() {
+            return Take::Empty;
+        }
+        inner.head.fetch_max(head + 1, Ordering::AcqRel);
+        // SAFETY: `p` points to a live boxed task owned by the queue.
+        Take::Got(unsafe { (*p).clone() })
+    }
+
+    /// **Bounded-multiplicity steal** (Castañeda-Piña B-WS-MULT). Like [`steal`](Self::steal),
+    /// but a thief first claims the slot with a single `false→true` CAS on a per-slot flag, so
+    /// **no two thieves ever take the same task**. (A concurrent owner [`take`] may still take
+    /// it once — the paper's bounded variant excludes only thief/thief duplication, not
+    /// take/steal.) Returns [`Take::Empty`] when the head slot is empty or already claimed.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Requires a [`bounded`](IdempotentWorker::bounded) queue. The per-slot claim flags are
+    /// only race-free when the array never grows: with growth, a thief on a retired array and a
+    /// thief on the grown array could both win the claim for the same logical slot. A growable
+    /// queue would silently break the no-double-take guarantee, so this asserts bounded mode.
+    pub fn steal_exclusive(&self) -> Take<T> {
+        let inner = &*self.inner;
+        debug_assert!(
+            inner.bounded,
+            "steal_exclusive requires IdempotentWorker::bounded (growth breaks per-slot claims)"
+        );
+        let head = inner.head.load(Ordering::Acquire);
+        let arr = inner.tasks.load(Ordering::Acquire);
+        // SAFETY: `arr` is a live array pointer.
+        let cells: &[AtomicPtr<T>] = unsafe { &(*arr).cells };
+        let claims: &[AtomicBool] = unsafe { &(*arr).claimed };
+        let p = match cells.get(head) {
+            Some(c) => c.load(Ordering::Acquire),
+            None => return Take::Empty,
+        };
+        if p.is_null() {
+            return Take::Empty;
+        }
+        // Claim the slot: exactly one thief wins the false→true transition.
+        if claims[head]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another thief already claimed this slot. Nudge head forward so the next call
+            // makes progress, then report empty for this attempt.
+            inner.head.fetch_max(head + 1, Ordering::AcqRel);
             return Take::Empty;
         }
         inner.head.fetch_max(head + 1, Ordering::AcqRel);
@@ -392,6 +483,59 @@ mod tests {
             assert!(
                 got <= max_consumers,
                 "task {v} taken {got} times, exceeds multiplicity bound {max_consumers}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_put_rejects_when_full() {
+        let mut w = IdempotentWorker::<usize>::bounded(4);
+        for i in 0..4 {
+            assert!(w.put(i), "slot {i} within capacity");
+        }
+        assert!(!w.put(99), "put past capacity must return false");
+        // The four accepted tasks are still retrievable in order.
+        for i in 0..4 {
+            assert_eq!(w.take(), Take::Got(i));
+        }
+        assert_eq!(w.take(), Take::Empty);
+    }
+
+    #[test]
+    fn bounded_steal_no_two_thieves_same_task() {
+        // With steal_exclusive and NO owner take, every task is taken by at most one thief.
+        let n = 100_000;
+        let thieves = 6;
+        let mut w = IdempotentWorker::<usize>::bounded(n);
+        for i in 0..n {
+            assert!(w.put(i), "bounded queue should accept up to capacity");
+        }
+        let counts: StdArc<Vec<AtomicUsize>> =
+            StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+        let done = StdArc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..thieves {
+                let s = w.stealer();
+                let counts = StdArc::clone(&counts);
+                let done = StdArc::clone(&done);
+                scope.spawn(move || {
+                    while done.load(StdOrdering::SeqCst) < n {
+                        if let Take::Got(v) = s.steal_exclusive() {
+                            counts[v].fetch_add(1, StdOrdering::SeqCst);
+                            done.fetch_add(1, StdOrdering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Bounded-multiplicity (thieves only): every task taken exactly once, never twice.
+        for (v, c) in counts.iter().enumerate() {
+            let got = c.load(StdOrdering::SeqCst);
+            assert_eq!(
+                got, 1,
+                "task {v} taken {got} times by thieves (must be exactly 1)"
             );
         }
     }

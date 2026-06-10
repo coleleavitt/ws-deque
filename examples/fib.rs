@@ -104,9 +104,10 @@ fn main() {
 
     let start = std::time::Instant::now();
     std::thread::scope(|scope| {
-        for (me, local) in owners.iter().enumerate() {
+        // Move each owned `Worker` into its own thread (`Worker` is `Send` but not `Sync`).
+        for (me, local) in owners.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
-            scope.spawn(move || worker_loop(me, local, &shared));
+            scope.spawn(move || worker_loop(me, &local, &shared));
         }
     });
     let elapsed = start.elapsed();

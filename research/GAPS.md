@@ -93,10 +93,19 @@ point). Measured ~1.4× faster owner put/take than Chase-Lev (137 µs vs 192 µs
 isolating the eliminated fence+CAS. Use for idempotent workloads (parallel SAT, graph search,
 fixpoint, branch-and-bound); use `Worker` when exactly-once is required.
 
-⬜ Deferred from this paper: the linked-list array backing (paper's approach 2, better under
-heavy growth — we use approach 1, doubling); the swap-based *bounded-multiplicity* `Steal`
-variant (B-WS-MULT) that guarantees no two **thieves** take the same task; the weak-multiplicity
-FIFO variant (WS-WMULT).
+✅ **B-WS-MULT bounded-multiplicity steal** is now implemented:
+`IdempotentWorker::bounded(capacity)` + `IdempotentStealer::steal_exclusive()`. A thief claims
+the head slot with a single `false→true` CAS on a per-slot flag, so **no two thieves ever take
+the same task** (a `take`/`steal` pair still may — that's the paper's bounded guarantee). This
+requires a *fixed-capacity* queue: per-slot claim flags are only race-free when there is exactly
+one array for the queue's lifetime, so `steal_exclusive` debug-asserts bounded mode and `put`
+returns `false` when full rather than growing. (This soundness boundary was caught by the
+advisor — a growable claim scheme lets a thief on a retired array and one on the grown array
+both claim the same logical slot.) Tested with a 6-thief no-double-take stress, TSan-clean.
+
+⬜ Still deferred from this paper: the linked-list array backing (paper's approach 2, better
+under heavy growth — we use approach 1, doubling); the weak-multiplicity FIFO variant
+(WS-WMULT).
 
 ## Chase & Lev, *Dynamic Circular Work-Stealing Deque* (SPAA'05) — the core paper
 
@@ -104,11 +113,11 @@ FIFO variant (WS-WMULT).
 | --- | --- | --- | --- |
 | §2 | Cyclic array, monotone `top`, owner push/pop bottom + thief CAS steal top | ✅ | `Worker` / `Stealer`. |
 | §2 | Growable buffer (double on full) | ✅ | `Buffer::grow`. |
-| §2.3 | Cache a local upper bound on `top` to avoid reading contended `top` every push | ⬜ | Pure micro-opt; would help the push hot path. Deferred. |
+| §2.3 | Cache a local upper bound on `top` to avoid reading contended `top` every push | ✅ | `Worker.cached_top` (owner-only `Cell`): `push` consults the cached lower bound and only Acquire-loads the shared `top` when the buffer might be full. ~3% faster push/pop; TSan-clean. |
 | §3 | **Array shrinking** when `b−t < cap/K`, K≥3 | ✅ | `Worker::perhaps_shrink` on the non-racing pop branch + `shrinks_after_draining` test. |
 | §3.1 | Shrink-without-copying (retain chain of smaller arrays, low-water-mark) | ⬜ | Optimization on top of §3; we always relocate. |
 | §3.2 | Combine multiple shrinks (a5→a1 directly) | ⬜ | Same. |
-| §4 | **Shared buffer pool / GC-free reclamation** by bumping `top`+`bottom` by array size to abort in-flight thieves | 🟡 | We instead use **retain-until-drop**: retired buffers live until the deque drops (bounded by `O(log max_len)` arrays). Simpler, dependency-free, race-free; trades a bounded amount of memory for not needing the abort trick or epoch GC. |
+| §4 | **Buffer reclamation** (free grown/shrunk-out buffers mid-life) | ✅ | **Quiescent-state reclamation**: an `in_flight` steal counter brackets each thief's buffer dereference with symmetric `SeqCst` fences (the same protocol shape as top/bottom). The owner's `try_reclaim` frees the retired list only when it observes `in_flight == 0` — a point at which no thief holds a retired-buffer pointer and a new thief can only load the live buffer. Replaces retain-until-drop, so the backlog stays bounded under grow/shrink cycling. **loom-verified** (exhaustive grow-during-steal model), **TSan-clean** under a 200k grow-during-steal stress, 20× stress-looped. |
 | §2 | Correct C11 memory orderings | ✅ | Per Lê et al.; **loom**-model-checked + **ThreadSanitizer**-clean. |
 
 ## Lê, Pop, Cohen, Zappa Nardelli, *Correct and Efficient Work-Stealing for Weak Memory Models* (PPoPP'13)
@@ -128,9 +137,9 @@ FIFO variant (WS-WMULT).
 
 | Mechanism | Status | Notes |
 | --- | --- | --- |
-| **Locality-biased steals** (bias victim choice to same-socket) | ⬜ | Needs a multi-deque scheduler + topology; out of scope for a single-deque primitive. A scheduler built on `ws-deque` (see `examples/fib.rs`) is where this belongs. |
-| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ⬜ | Scheduler-level, same as above. |
-| Locality-hint API | ⬜ | Scheduler-level. |
+| **Locality-biased steals** (bias victim choice to same-socket) | ✅ | `scheduler::run_with(workers, group_size, …)`: workers split into contiguous locality groups; an idle thief biases ~half its random-victim probes to its own group before going global. Correctness-preserving (irregular tree + parallel sum complete under bias), TSan-clean + 15× stress-looped. (Behavioural locality *win* is workload/hardware-dependent and not asserted.) |
+| **Lazy work pushing** (push task to honor a locality hint, charge span not work) | ⬜ | The lifeline scheduler's pull-based stealing covers load balancing; explicit push-to-buddy deferred. |
+| Locality-hint API | ⬜ | Per-task hints deferred; group-level bias (above) covers the common NUMA case. |
 | Work-first principle (cost on the steal, not the work, path) | ✅ | Honored: owner push/pop take no CAS on the common path; only steals and last-element pops CAS. |
 
 ## Production-deque features (industry practice, beyond the papers)
@@ -138,10 +147,10 @@ FIFO variant (WS-WMULT).
 | Feature | Status | Notes |
 | --- | --- | --- |
 | **`steal_batch` / steal-half** (Tokio, crossbeam, Rayon) | ✅ | `Stealer::steal_batch_and_pop` moves ~half the victim's work in one CAS. Concurrent + TSan-tested. |
-| Index wraparound on overflow | ⬜ | We use monotone `isize`; Chase-Lev assumes no overflow (a 64-bit index at 10⁹ ops/s lasts ~500 years). crossbeam handles wrapping. |
+| Index wraparound on overflow | ✅ | All `top`/`bottom` arithmetic uses `wrapping_add`/`wrapping_sub` and count-based loops, so the deque is correct even past `isize::MAX`. Tested by seeding indices at `isize::MAX - k` (`correct_across_index_wraparound`, `wraparound_concurrent_no_loss`). |
 | **loom model checking** | ✅ | `--cfg loom` suite. |
 | **ThreadSanitizer** | ✅ | All concurrent tests + the `fib` example run clean under `-Zsanitizer=thread`. |
-| FIFO (`new_fifo`) variant | ⬜ | Only the LIFO owner deque is implemented. |
+| FIFO (`new_fifo`) variant | ✅ | `Worker::new_fifo()`: the owner pops the *oldest* task from the top via the shared steal core (a retry loop), matching crossbeam/Tokio `new_fifo`. FIFO-order + concurrent-no-loss tests, TSan-clean. |
 | Bench vs `crossbeam-deque` | ✅ | `benches/vs_crossbeam.rs`. |
 
 ### Benchmark reality (this machine, `cargo bench`, N=4096)
@@ -169,18 +178,18 @@ small-value payloads (an inline atomic-cell fast path) is the obvious next optim
 - ⭐ Saraswat et al. / Zhang et al., *Lifeline-based Global Load Balancing* / *GLB*
   (arXiv 1312.5691) — **the lifeline scheduler** (`src/scheduler.rs`).
 
-**Read, deferred (safe memory reclamation — the principled fix for retain-until-drop):**
-The deque currently retains grown-out buffers until the whole deque drops (memory bounded by
-`O(log max_len)` arrays, never freed mid-life). To free them *while live* without a use-after-
-free against in-flight thieves needs a real SMR scheme:
+**Safe memory reclamation — IMPLEMENTED (quiescent-state), with SMR papers for context:**
+The deque now reclaims retired buffers mid-life via a **quiescent-state** scheme (an `in_flight`
+steal counter + symmetric `SeqCst` fences; the owner frees the retired list only at `in_flight
+== 0`). This is the dependency-free analogue of epoch-based reclamation — sufficient because the
+deque has a *single* retiring thread (the owner). It is loom-verified and TSan-clean. The
+following heavier SMR schemes were read as the alternative design points (deferred — our
+single-retirer setting does not need their generality):
 - Nikolaev & Ravindran, *Hyaline: Snapshot-Free, Transparent, Robust Memory Reclamation*
-  (arXiv 1905.07903) — reference-counting-on-retire SMR with balanced reclamation work; the
-  cleanest drop-in for freeing retired buffers. The strongest candidate.
+  (arXiv 1905.07903) — reference-counting-on-retire SMR with balanced reclamation work.
 - Nikolaev & Ravindran, *Crystalline: Fast and Memory-Efficient Wait-Free Reclamation*
   (arXiv 2108.02763) and *WFE: Universal Wait-Free Memory Reclamation* (arXiv 2001.01999) —
-  wait-free reclamation; stronger progress at higher complexity.
-  Deferred because retain-until-drop is *correct* and dependency-free; reclamation is a
-  memory-footprint optimization, not a correctness fix.
+  wait-free reclamation; needed only for multi-retirer lock-free structures.
 
 **Read, deferred (queue building blocks for a scheduler's global injector):**
 - Nikolaev & Ravindran, *wCQ: A Fast Wait-Free Queue with Bounded Memory Usage*
