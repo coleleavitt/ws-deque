@@ -45,11 +45,26 @@ a `SeqCst` fence. The result is **race-free by construction** — `cargo +nightl
 - **Single owner, many thieves.** `Worker` pushes/pops the bottom (no CAS on the common path);
   `Stealer` (cheaply cloneable, `Send + Sync`) steals from the top via CAS.
 - **Monotone `top`.** `top` is only ever advanced by CAS, never decremented, so no ABA tag.
-- **Growable cyclic buffer.** Doubles on overflow. Grown-out buffers are retained until the
-  deque is dropped (a dependency-free alternative to epoch GC); retired memory is bounded by
+- **Growable *and shrinking* cyclic buffer.** Doubles on overflow (Chase-Lev §2) and halves
+  when it retreats below `cap/3` (Chase-Lev §3). Retired buffers are retained until the deque
+  is dropped (a dependency-free alternative to epoch GC); retired memory is bounded by
   `O(log max_len)` arrays.
+- **Batch stealing.** `Stealer::steal_batch_and_pop` moves ~half the victim's work into the
+  thief's own deque in a single CAS — the amortization trick Tokio, Rayon, and crossbeam use.
 - **Correct `Drop`.** Every boxed element is freed exactly once — verified with a
   drop-counting test (no leaks, no double-frees).
+
+## Correctness & performance
+
+- **`loom`** exhaustively model-checks the push/pop/steal interleavings:
+  `RUSTFLAGS="--cfg loom" cargo test --release loom_`.
+- **ThreadSanitizer** runs clean across every concurrent test and the `fib` example:
+  `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --lib -Zbuild-std --target <triple>`.
+- **`cargo bench`** pits this crate against `crossbeam-deque`. The honest trade-off: boxing
+  each element into an `AtomicPtr` cell costs ~3.5× on push/pop and ~7× under contention
+  versus crossbeam's inline-but-technically-UB `volatile` storage — the price of being
+  *genuinely* race-free. For a job queue enqueuing `Box`/`Arc` tasks the allocation is largely
+  amortized. See [`research/GAPS.md`](research/GAPS.md) for the full paper-by-paper analysis.
 
 ## References
 

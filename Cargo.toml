@@ -2,7 +2,7 @@
 name = "ws-deque"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.63"
+rust-version = "1.66"
 authors = ["Cole Leavitt"]
 license = "MIT OR Apache-2.0"
 description = "A lock-free, dependency-free, ThreadSanitizer-clean Chase-Lev work-stealing deque"
@@ -16,9 +16,23 @@ exclude = ["research/*.pdf"]
 name = "ws_deque"
 path = "src/lib.rs"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [[example]]
 name = "fib"
 path = "examples/fib.rs"
+
+[dev-dependencies]
+crossbeam-deque = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "vs_crossbeam"
+harness = false
 
 [profile.release]
 lto = true

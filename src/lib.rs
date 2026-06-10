@@ -48,11 +48,28 @@
 //! design notes, including the ThreadSanitizer data-race finding that motivated the
 //! atomic-cell storage.
 
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::boxed::Box;
 use std::ptr;
+#[cfg(not(loom))]
 use std::sync::Arc;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering, fence};
+use std::vec::Vec;
+
+// Atomics + Arc are sourced from `loom` under `--cfg loom` (for exhaustive model checking of
+// the memory orderings) and from `std` otherwise. `fence` and `Ordering` come from the same
+// place so the orderings being checked are exactly the ones shipped.
+#[cfg(loom)]
+use loom::sync::Arc;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicIsize, AtomicPtr, Ordering, fence};
+
+/// Smallest backing-buffer capacity; the deque never shrinks below this.
+const MIN_CAPACITY: usize = 16;
+
+/// The deque shrinks when fewer than `cap / SHRINK_FACTOR` elements remain. Per Chase-Lev §3
+/// this must be `>= 3` so the survivors comfortably fit the half-size buffer.
+const SHRINK_FACTOR: usize = 3;
 
 /// Outcome of a [`Stealer::steal`] attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -80,25 +97,23 @@ impl<T> Steal<T> {
 /// every slot access a real atomic operation, so a thief's speculative read can never race
 /// the owner's overwriting push (no UB, ThreadSanitizer-clean).
 struct Buffer<T> {
-    ptr: *mut AtomicPtr<T>,
+    cells: Box<[AtomicPtr<T>]>,
     cap: usize, // always a power of two
 }
 
 impl<T> Buffer<T> {
     fn alloc(cap: usize) -> Self {
         debug_assert!(cap.is_power_of_two());
-        let layout = Layout::array::<AtomicPtr<T>>(cap).expect("capacity overflow");
-        // SAFETY: layout has non-zero size because cap >= 1.
-        let ptr = unsafe { alloc(layout) } as *mut AtomicPtr<T>;
-        if ptr.is_null() {
-            handle_alloc_error(layout);
+        // A boxed slice of null `AtomicPtr`s — safe, no manual layout/dealloc, and the cells
+        // live at stable addresses for the buffer's lifetime (so `cell()` references are ok).
+        let mut v = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            v.push(AtomicPtr::new(ptr::null_mut()));
         }
-        // Initialize every cell to null so partial buffers are well-defined.
-        for i in 0..cap {
-            // SAFETY: `i < cap`, the allocation is exactly `cap` cells.
-            unsafe { ptr::write(ptr.add(i), AtomicPtr::new(ptr::null_mut())) };
+        Buffer {
+            cells: v.into_boxed_slice(),
+            cap,
         }
-        Buffer { ptr, cap }
     }
 
     #[inline]
@@ -109,7 +124,7 @@ impl<T> Buffer<T> {
     /// Reference to the atomic cell for a logical index (indices wrap modulo `cap`).
     #[inline]
     unsafe fn cell(&self, index: isize) -> &AtomicPtr<T> {
-        &*self.ptr.add(index as usize & self.mask())
+        &self.cells[index as usize & self.mask()]
     }
 
     /// Store a boxed element into a slot (Relaxed: ordered by the `bottom` Release store).
@@ -125,23 +140,25 @@ impl<T> Buffer<T> {
         self.cell(index).load(Ordering::Relaxed)
     }
 
-    /// Allocate a buffer of double the capacity and copy the cell pointers for `[top, bottom)`.
-    /// Only the *pointers* move; the boxed elements they reference are untouched.
-    unsafe fn grow(&self, bottom: isize, top: isize) -> Buffer<T> {
-        let bigger = Buffer::alloc(self.cap * 2);
+    /// Allocate a buffer of `new_cap` slots and copy the cell pointers for `[top, bottom)`.
+    /// Only the *pointers* move; the boxed elements they reference are untouched. Works for
+    /// both growth (`new_cap > cap`) and shrinkage (`new_cap < cap`) because elements are
+    /// indexed modulo capacity, so `top`/`bottom` need not change.
+    unsafe fn resized(&self, new_cap: usize, bottom: isize, top: isize) -> Buffer<T> {
+        debug_assert!((bottom - top) as usize <= new_cap.saturating_sub(1));
+        let other = Buffer::alloc(new_cap);
         let mut i = top;
         while i < bottom {
             let p = self.cell(i).load(Ordering::Relaxed);
-            bigger.cell(i).store(p, Ordering::Relaxed);
+            other.cell(i).store(p, Ordering::Relaxed);
             i += 1;
         }
-        bigger
+        other
     }
 
-    /// Free the backing allocation. Does NOT free any referenced boxed elements.
-    unsafe fn dealloc(&self) {
-        let layout = Layout::array::<AtomicPtr<T>>(self.cap).expect("capacity overflow");
-        dealloc(self.ptr as *mut u8, layout);
+    /// Allocate a buffer of double the capacity and copy the live cell pointers.
+    unsafe fn grow(&self, bottom: isize, top: isize) -> Buffer<T> {
+        self.resized(self.cap * 2, bottom, top)
     }
 }
 
@@ -212,15 +229,14 @@ impl<T> Drop for Inner<T> {
                 }
                 i += 1;
             }
-            buf.dealloc();
+            // Dropping the `Box<Buffer>` frees its boxed cell slice automatically.
             drop(Box::from_raw(active));
 
-            // Free retired buffers (allocation only — their elements were either moved out
-            // or are bitwise duplicates owned by the active buffer).
+            // Free retired buffers (allocations only — their elements were either moved out
+            // or are duplicates owned by the active buffer).
             let mut node = self.retired.load(Ordering::Relaxed);
             while !node.is_null() {
                 let owned = Box::from_raw(node);
-                (*owned.buffer).dealloc();
                 drop(Box::from_raw(owned.buffer));
                 node = owned.next;
             }
@@ -270,6 +286,35 @@ impl<T> Worker<T> {
     /// Whether the deque is empty (approximate under concurrency).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Current backing-buffer capacity (number of slots). Exposed mainly for tests.
+    pub fn capacity(&self) -> usize {
+        let buf = self.inner.buffer.load(Ordering::Relaxed);
+        // SAFETY: the buffer pointer is always valid for the deque's lifetime.
+        unsafe { (*buf).cap }
+    }
+
+    /// Shrink the backing buffer when the deque has retreated far below its capacity.
+    ///
+    /// Per Chase-Lev §3: when fewer than `cap / SHRINK_FACTOR` elements remain (and we are
+    /// above the minimum capacity), relocate them into a half-size buffer and retire the old
+    /// one. Safe under the retain-until-drop policy: a concurrent thief still indexing the old
+    /// buffer cannot use-after-free because retired buffers live until the deque is dropped.
+    fn perhaps_shrink(&self, bottom: isize, top: isize, buf_ptr: *mut Buffer<T>) {
+        let inner = &*self.inner;
+        // SAFETY: `buf_ptr` is the live active buffer passed in by `pop`.
+        let cap = unsafe { (*buf_ptr).cap };
+        let size = (bottom - top).max(0) as usize;
+        if cap > MIN_CAPACITY && size < cap / SHRINK_FACTOR {
+            let smaller_cap = (cap / 2).max(MIN_CAPACITY);
+            // SAFETY: `size <= smaller_cap - 1` holds because size < cap/3 <= smaller_cap/1.
+            let smaller = unsafe { (*buf_ptr).resized(smaller_cap, bottom, top) };
+            let smaller_ptr = Box::into_raw(Box::new(smaller));
+            inner.buffer.store(smaller_ptr, Ordering::Release);
+            // SAFETY: retire (don't free) the old buffer; in-flight thieves may still read it.
+            unsafe { inner.retire(buf_ptr) };
+        }
     }
 
     /// Push a value onto the bottom of the deque. Owner-only.
@@ -324,6 +369,8 @@ impl<T> Worker<T> {
 
         if t < b {
             // Not the last element — no thief can be racing for it. We own the box.
+            // Opportunistically shrink the buffer if it has retreated far below capacity.
+            self.perhaps_shrink(b, t, buf_ptr);
             return Some(unsafe { *Box::from_raw(boxed) });
         }
 
@@ -399,6 +446,56 @@ impl<T> Stealer<T> {
             Steal::Retry
         }
     }
+
+    /// Steal roughly **half** of the victim's elements, moving them into `dest`'s deque, and
+    /// return one of them directly. This is the optimization real runtimes (Tokio, Rayon,
+    /// crossbeam) use: amortize the expensive CAS over a batch instead of one item per steal.
+    ///
+    /// The whole batch is claimed with a single `compare_exchange` that advances `top` by the
+    /// batch size, so a losing thief retries cleanly and no element is taken twice. `dest`
+    /// must be a fresh/owned `Worker` (typically the thief's own empty deque).
+    pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
+        let inner = &*self.inner;
+        let t = inner.top.load(Ordering::Acquire);
+        fence(Ordering::SeqCst);
+        let b = inner.bottom.load(Ordering::Acquire);
+
+        let available = b - t;
+        if available <= 0 {
+            return Steal::Empty;
+        }
+
+        // Take half (rounded up), capped so we always leave the contract simple. The first of
+        // the batch is returned to the caller; the rest go into `dest`.
+        let batch = ((available + 1) / 2).min(available);
+        let buf_ptr = inner.buffer.load(Ordering::Acquire);
+
+        // Read all pointers in the batch BEFORE the CAS (the owner may refill these slots
+        // after a successful CAS). Reads are atomic, so they cannot race the owner's push.
+        // SAFETY: indices `t..t+batch` are all `< b`, hence live in the loaded buffer.
+        let first = unsafe { (*buf_ptr).read(t) };
+        let mut rest: Vec<*mut T> = Vec::with_capacity((batch - 1) as usize);
+        for off in 1..batch {
+            rest.push(unsafe { (*buf_ptr).read(t + off) });
+        }
+
+        // Claim the entire batch with one CAS advancing `top` by `batch`.
+        if inner
+            .top
+            .compare_exchange(t, t + batch, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            // We own every box in the batch. Push the remainder into `dest`, return the first.
+            for p in rest {
+                // SAFETY: `p` is a uniquely-owned boxed element we just claimed.
+                dest.push(unsafe { *Box::from_raw(p) });
+            }
+            Steal::Success(unsafe { *Box::from_raw(first) })
+        } else {
+            // Lost the race; every pointer we read belongs to the winner. Free nothing.
+            Steal::Retry
+        }
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +551,34 @@ mod tests {
     }
 
     #[test]
+    fn shrinks_after_draining() {
+        let w = Worker::<usize>::with_log_capacity(1);
+        let n = 10_000;
+        for i in 0..n {
+            w.push(i);
+        }
+        let grown = w.capacity();
+        assert!(grown >= n, "should have grown to hold {n}: cap={grown}");
+
+        // Pop almost everything; the buffer should shrink back toward the minimum.
+        for _ in 0..(n - 5) {
+            w.pop();
+        }
+        let shrunk = w.capacity();
+        assert!(
+            shrunk < grown,
+            "capacity should shrink: {grown} -> {shrunk}"
+        );
+        assert!(shrunk >= MIN_CAPACITY, "never below MIN_CAPACITY");
+
+        // Remaining elements are still intact and in LIFO order.
+        for expected in (0..5).rev() {
+            assert_eq!(w.pop(), Some(expected));
+        }
+        assert_eq!(w.pop(), None);
+    }
+
+    #[test]
     fn drops_remaining_elements_once() {
         // A non-Copy payload that counts live instances detects double-free / leak.
         struct Counted(StdArc<AtomicUsize>);
@@ -496,6 +621,33 @@ mod tests {
                 }
                 Steal::Retry => {}
                 Steal::Empty if stolen_count.load(Ordering::SeqCst) >= total => break,
+                Steal::Empty => {}
+            }
+        }
+    }
+
+    /// Record one consumed value (helper shared by the batch thief, keeps nesting shallow).
+    fn record(seen: &[AtomicUsize], consumed: &AtomicUsize, v: usize) {
+        seen[v].fetch_add(1, Ordering::SeqCst);
+        consumed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Batch-stealing thief: drains its local deque, then steals half-batches until done.
+    fn run_batch_thief(
+        s: &Stealer<usize>,
+        seen: &[AtomicUsize],
+        consumed: &AtomicUsize,
+        total: usize,
+    ) {
+        let local = Worker::<usize>::new();
+        loop {
+            while let Some(v) = local.pop() {
+                record(seen, consumed, v);
+            }
+            match s.steal_batch_and_pop(&local) {
+                Steal::Success(v) => record(seen, consumed, v),
+                Steal::Retry => {}
+                Steal::Empty if consumed.load(Ordering::SeqCst) >= total => break,
                 Steal::Empty => {}
             }
         }
@@ -550,5 +702,117 @@ mod tests {
                 "value {v} not consumed exactly once"
             );
         }
+    }
+
+    #[test]
+    fn steal_batch_takes_about_half() {
+        let victim = Worker::<usize>::new();
+        let thief_dest = Worker::<usize>::new();
+        let s = victim.stealer();
+        for i in 0..100 {
+            victim.push(i);
+        }
+
+        // One batch steal should move ~half: 1 returned + ~49 into dest.
+        let got = s.steal_batch_and_pop(&thief_dest).success();
+        assert!(got.is_some());
+        let moved = thief_dest.len();
+        assert!(
+            (40..=55).contains(&(moved + 1)),
+            "batch should be about half of 100, got {}",
+            moved + 1
+        );
+        // Victim keeps the rest; nothing is lost.
+        assert_eq!(victim.len() + thief_dest.len() + 1, 100);
+    }
+
+    #[test]
+    fn concurrent_batch_steal_no_loss() {
+        let w = Worker::<usize>::new();
+        let n: usize = 100_000;
+        let thieves = 4;
+
+        let seen: StdArc<Vec<AtomicUsize>> =
+            StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+        let consumed = StdArc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..thieves {
+                let s = w.stealer();
+                let seen = StdArc::clone(&seen);
+                let consumed = StdArc::clone(&consumed);
+                scope.spawn(move || run_batch_thief(&s, &seen, &consumed, n));
+            }
+
+            for i in 0..n {
+                w.push(i);
+            }
+            while let Some(v) = w.pop() {
+                seen[v].fetch_add(1, Ordering::SeqCst);
+                consumed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        for (v, slot) in seen.iter().enumerate() {
+            assert_eq!(
+                slot.load(Ordering::SeqCst),
+                1,
+                "value {v} not consumed exactly once"
+            );
+        }
+    }
+}
+
+/// Exhaustive model-checked tests under `loom`. loom replays every legal interleaving of the
+/// atomic operations to prove the memory orderings are correct (not just "didn't crash on
+/// this run", which is all ThreadSanitizer can promise). Kept tiny because loom's state space
+/// explodes combinatorially.
+///
+/// Run with: `RUSTFLAGS="--cfg loom" cargo test --release loom_`
+#[cfg(loom)]
+#[cfg(test)]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn loom_owner_pop_vs_one_thief() {
+        loom::model(|| {
+            let worker = Worker::<u32>::with_log_capacity(4); // 16 slots, no grow needed
+            let stealer = worker.stealer();
+
+            worker.push(1);
+            worker.push(2);
+
+            let thief = loom::thread::spawn(move || matches!(stealer.steal(), Steal::Success(_)));
+
+            // Owner pops concurrently with the single steal.
+            let owner_got = worker.pop().is_some();
+            let thief_got = thief.join().unwrap();
+
+            // Two items, two consumers, no overlap: between owner and thief at most 2 succeed,
+            // and the remaining item (if any) is still poppable. No item is taken twice.
+            let mut remaining = 0;
+            while worker.pop().is_some() {
+                remaining += 1;
+            }
+            let consumed = owner_got as usize + thief_got as usize + remaining;
+            assert_eq!(consumed, 2, "every pushed item consumed exactly once");
+        });
+    }
+
+    #[test]
+    fn loom_push_then_steal() {
+        loom::model(|| {
+            let worker = Worker::<u32>::with_log_capacity(4);
+            let stealer = worker.stealer();
+            worker.push(42);
+
+            let thief = loom::thread::spawn(move || stealer.steal().success());
+            let stolen = thief.join().unwrap();
+            let popped = worker.pop();
+
+            // Exactly one of {thief, owner} gets the single element.
+            assert_eq!(stolen.is_some() as usize + popped.is_some() as usize, 1);
+        });
     }
 }
