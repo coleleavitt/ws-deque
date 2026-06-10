@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+
+# Third-party paper PDFs and text extractions are NOT redistributed here to avoid
+# republishing copyrighted academic material. See research/SYNTHESIS.md for citations
+# and links (arXiv etc.). Fetch the papers yourself from the listed sources.
+research/*.pdf
+research/*.txt

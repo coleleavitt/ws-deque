@@ -1,0 +1,554 @@
+//! A lock-free Chase-Lev work-stealing deque.
+//!
+//! This is a self-contained, dependency-free implementation of the dynamic circular
+//! work-stealing deque from:
+//!
+//! - D. Chase & Y. Lev, *Dynamic Circular Work-Stealing Deque*, SPAA 2005.
+//!
+//! with the C11 atomic memory orderings established (and machine-checked) by:
+//!
+//! - N. M. Lê, A. Pop, A. Cohen, F. Zappa Nardelli, *Correct and Efficient Work-Stealing
+//!   for Weak Memory Models*, PPoPP 2013, and
+//! - J. Choi, *Formal Verification of Chase-Lev Deque in Concurrent Separation Logic*, 2023
+//!   (arXiv:2309.03642).
+//!
+//! The deque has a single **owner** ([`Worker`]) that pushes and pops from the *bottom*,
+//! and any number of **thieves** ([`Stealer`]) that steal from the *top*. Only the owner
+//! mutates `bottom`; `top` is monotonically increasing and is only advanced via CAS, so no
+//! ABA tag field is needed.
+//!
+//! # Element storage & data-race freedom
+//!
+//! A naive Chase-Lev implementation reads/writes the array slots with plain `ptr::read`/
+//! `ptr::write`. That is a genuine data race (and C11 UB): a thief speculatively reads a
+//! slot *before* its CAS, which can race with the owner overwriting that physical slot via a
+//! later `push`. `crossbeam-deque` papers over this with `read_volatile`/`write_volatile`
+//! and explicitly documents it as "technically UB" — ThreadSanitizer still flags it.
+//!
+//! Following Lê et al., this implementation makes slot accesses **truly atomic**: each
+//! element is heap-boxed and the array cell holds an [`AtomicPtr<T>`]. Slots are loaded and
+//! stored with `Relaxed` ordering (the indices carry the happens-before via an
+//! Acquire/Release pair and a SeqCst fence), so there is no data race at all — it is
+//! ThreadSanitizer-clean, as production job queues are: they enqueue pointers, not values.
+//!
+//! # Memory reclamation
+//!
+//! The basic Chase-Lev algorithm needs a garbage collector to reclaim grown-out buffers,
+//! because a thief may still be indexing into an old buffer when the owner grows. To stay
+//! dependency-free (no epoch GC), this implementation uses a **retain-until-drop** policy:
+//! retired (grown-out) cell arrays are pushed onto an internal list and freed only when the
+//! last handle to the deque is dropped. Total retired memory is bounded by `O(log(max_len))`
+//! cell arrays. Each live element's `Box<T>` is owned by whichever consumer wins it (a
+//! successful `pop` or `steal`); any element still in the active buffer's `[top, bottom)`
+//! range at drop time is freed exactly once.
+//!
+//! This crate is a complete, tested, dependency-free implementation of the canonical
+//! work-stealing primitive that underlies Rayon, Tokio, and Go — provided for study and
+//! standalone use. See `research/` for the source papers and `research/SYNTHESIS.md` for the
+//! design notes, including the ThreadSanitizer data-race finding that motivated the
+//! atomic-cell storage.
+
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::boxed::Box;
+use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering, fence};
+
+/// Outcome of a [`Stealer::steal`] attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Steal<T> {
+    /// The deque was observed empty.
+    Empty,
+    /// Lost a race with another thief or an emptying pop; the caller should retry.
+    Retry,
+    /// Successfully stole a value from the top of the deque.
+    Success(T),
+}
+
+impl<T> Steal<T> {
+    /// Returns the stolen value, if any.
+    pub fn success(self) -> Option<T> {
+        match self {
+            Steal::Success(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// A power-of-two-sized cyclic buffer of atomic cells. Each cell holds a `*mut T` that
+/// points to a heap-boxed element (or is null for an empty slot). Using `AtomicPtr` makes
+/// every slot access a real atomic operation, so a thief's speculative read can never race
+/// the owner's overwriting push (no UB, ThreadSanitizer-clean).
+struct Buffer<T> {
+    ptr: *mut AtomicPtr<T>,
+    cap: usize, // always a power of two
+}
+
+impl<T> Buffer<T> {
+    fn alloc(cap: usize) -> Self {
+        debug_assert!(cap.is_power_of_two());
+        let layout = Layout::array::<AtomicPtr<T>>(cap).expect("capacity overflow");
+        // SAFETY: layout has non-zero size because cap >= 1.
+        let ptr = unsafe { alloc(layout) } as *mut AtomicPtr<T>;
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Initialize every cell to null so partial buffers are well-defined.
+        for i in 0..cap {
+            // SAFETY: `i < cap`, the allocation is exactly `cap` cells.
+            unsafe { ptr::write(ptr.add(i), AtomicPtr::new(ptr::null_mut())) };
+        }
+        Buffer { ptr, cap }
+    }
+
+    #[inline]
+    fn mask(&self) -> usize {
+        self.cap - 1
+    }
+
+    /// Reference to the atomic cell for a logical index (indices wrap modulo `cap`).
+    #[inline]
+    unsafe fn cell(&self, index: isize) -> &AtomicPtr<T> {
+        &*self.ptr.add(index as usize & self.mask())
+    }
+
+    /// Store a boxed element into a slot (Relaxed: ordered by the `bottom` Release store).
+    #[inline]
+    unsafe fn write(&self, index: isize, boxed: *mut T) {
+        self.cell(index).store(boxed, Ordering::Relaxed);
+    }
+
+    /// Atomically load the boxed-element pointer at a slot (Relaxed). May observe a
+    /// concurrent overwrite, which is fine — the CAS on `top` decides the real winner.
+    #[inline]
+    unsafe fn read(&self, index: isize) -> *mut T {
+        self.cell(index).load(Ordering::Relaxed)
+    }
+
+    /// Allocate a buffer of double the capacity and copy the cell pointers for `[top, bottom)`.
+    /// Only the *pointers* move; the boxed elements they reference are untouched.
+    unsafe fn grow(&self, bottom: isize, top: isize) -> Buffer<T> {
+        let bigger = Buffer::alloc(self.cap * 2);
+        let mut i = top;
+        while i < bottom {
+            let p = self.cell(i).load(Ordering::Relaxed);
+            bigger.cell(i).store(p, Ordering::Relaxed);
+            i += 1;
+        }
+        bigger
+    }
+
+    /// Free the backing allocation. Does NOT free any referenced boxed elements.
+    unsafe fn dealloc(&self) {
+        let layout = Layout::array::<AtomicPtr<T>>(self.cap).expect("capacity overflow");
+        dealloc(self.ptr as *mut u8, layout);
+    }
+}
+
+/// A node in the singly linked list of retired (grown-out) buffers.
+struct Retired<T> {
+    buffer: *mut Buffer<T>,
+    next: *mut Retired<T>,
+}
+
+/// Shared state behind both the [`Worker`] and its [`Stealer`]s.
+struct Inner<T> {
+    bottom: AtomicIsize,
+    top: AtomicIsize,
+    /// Pointer to the current (active) `Buffer<T>`, heap-boxed for atomic swap.
+    buffer: AtomicPtr<Buffer<T>>,
+    /// Head of the retain-until-drop list of retired buffers (owner-only producer).
+    retired: AtomicPtr<Retired<T>>,
+}
+
+impl<T> Inner<T> {
+    fn new(log_initial_cap: u32) -> Self {
+        let cap = 1usize << log_initial_cap;
+        let buffer = Box::into_raw(Box::new(Buffer::alloc(cap)));
+        Inner {
+            bottom: AtomicIsize::new(0),
+            top: AtomicIsize::new(0),
+            buffer: AtomicPtr::new(buffer),
+            retired: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Push a grown-out buffer onto the retire list. Only ever called by the owner, but the
+    /// CAS loop keeps it correct regardless.
+    unsafe fn retire(&self, buffer: *mut Buffer<T>) {
+        let node = Box::into_raw(Box::new(Retired {
+            buffer,
+            next: ptr::null_mut(),
+        }));
+        loop {
+            let head = self.retired.load(Ordering::Relaxed);
+            (*node).next = head;
+            if self
+                .retired
+                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // No concurrency here: the last Arc handle is being dropped.
+        let bottom = self.bottom.load(Ordering::Relaxed);
+        let top = self.top.load(Ordering::Relaxed);
+        let active = self.buffer.load(Ordering::Relaxed);
+
+        unsafe {
+            // Free the live elements still in the active buffer, exactly once.
+            let buf = &*active;
+            let mut i = top;
+            while i < bottom {
+                let p = buf.cell(i).load(Ordering::Relaxed);
+                if !p.is_null() {
+                    drop(Box::from_raw(p));
+                }
+                i += 1;
+            }
+            buf.dealloc();
+            drop(Box::from_raw(active));
+
+            // Free retired buffers (allocation only — their elements were either moved out
+            // or are bitwise duplicates owned by the active buffer).
+            let mut node = self.retired.load(Ordering::Relaxed);
+            while !node.is_null() {
+                let owned = Box::from_raw(node);
+                (*owned.buffer).dealloc();
+                drop(Box::from_raw(owned.buffer));
+                node = owned.next;
+            }
+        }
+    }
+}
+
+/// The single owner of a work-stealing deque. Pushes and pops at the bottom.
+///
+/// `Worker` is `Send` (it can be moved to the thread that will own it) but deliberately not
+/// `Sync`: only one thread may call [`push`](Worker::push) / [`pop`](Worker::pop).
+pub struct Worker<T> {
+    inner: Arc<Inner<T>>,
+}
+
+// SAFETY: a `Worker<T>` only ever exposes single-threaded owner operations; moving it across
+// threads is fine when `T: Send`. It is intentionally not `Sync`.
+unsafe impl<T: Send> Send for Worker<T> {}
+
+impl<T> Worker<T> {
+    /// Create a new deque owner with a default initial capacity (32 slots).
+    pub fn new() -> Self {
+        Self::with_log_capacity(5)
+    }
+
+    /// Create a new deque owner with `2^log_initial_cap` initial slots.
+    pub fn with_log_capacity(log_initial_cap: u32) -> Self {
+        Worker {
+            inner: Arc::new(Inner::new(log_initial_cap)),
+        }
+    }
+
+    /// Create a [`Stealer`] handle that can steal from the top of this deque.
+    pub fn stealer(&self) -> Stealer<T> {
+        Stealer {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Number of elements currently in the deque (approximate under concurrency).
+    pub fn len(&self) -> usize {
+        let b = self.inner.bottom.load(Ordering::Relaxed);
+        let t = self.inner.top.load(Ordering::Relaxed);
+        (b - t).max(0) as usize
+    }
+
+    /// Whether the deque is empty (approximate under concurrency).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Push a value onto the bottom of the deque. Owner-only.
+    pub fn push(&self, value: T) {
+        let inner = &*self.inner;
+        let b = inner.bottom.load(Ordering::Relaxed);
+        let t = inner.top.load(Ordering::Acquire);
+        let mut buf_ptr = inner.buffer.load(Ordering::Acquire);
+
+        // Grow if the buffer is full (leave one cell unused, per the paper).
+        // SAFETY: `buf_ptr` always points to a live, owner-installed buffer.
+        let cap = unsafe { (*buf_ptr).cap } as isize;
+        if b - t >= cap - 1 {
+            let bigger = unsafe { (*buf_ptr).grow(b, t) };
+            let bigger_ptr = Box::into_raw(Box::new(bigger));
+            inner.buffer.store(bigger_ptr, Ordering::Release);
+            // SAFETY: the old buffer is retained (not freed) until the deque is dropped, so
+            // a concurrent stealer still indexing into it cannot use-after-free.
+            unsafe { inner.retire(buf_ptr) };
+            buf_ptr = bigger_ptr;
+        }
+
+        // Box the element and publish its pointer into the slot.
+        let boxed = Box::into_raw(Box::new(value));
+        // SAFETY: `b` is within the (possibly grown) buffer's capacity.
+        unsafe { (*buf_ptr).write(b, boxed) };
+        // Release: publishes the slot write to thieves that Acquire-load `bottom`.
+        inner.bottom.store(b + 1, Ordering::Release);
+    }
+
+    /// Pop a value from the bottom of the deque. Owner-only. Returns `None` if empty.
+    pub fn pop(&self) -> Option<T> {
+        let inner = &*self.inner;
+        let b = inner.bottom.load(Ordering::Relaxed) - 1;
+        let buf_ptr = inner.buffer.load(Ordering::Relaxed);
+        inner.bottom.store(b, Ordering::Relaxed);
+
+        // This fence orders the `bottom` decrement before the `top` load, matching the
+        // SeqCst fence in a concurrent thief's `steal`.
+        fence(Ordering::SeqCst);
+
+        let t = inner.top.load(Ordering::Relaxed);
+
+        if t > b {
+            // Deque was empty; restore the canonical empty state (bottom == top).
+            inner.bottom.store(t, Ordering::Relaxed);
+            return None;
+        }
+
+        // SAFETY: `b` indexes a live slot in the active buffer; the cell holds the boxed elem.
+        let boxed = unsafe { (*buf_ptr).read(b) };
+
+        if t < b {
+            // Not the last element — no thief can be racing for it. We own the box.
+            return Some(unsafe { *Box::from_raw(boxed) });
+        }
+
+        // `t == b`: this is the last element. Race the thieves for it via CAS on `top`.
+        let won = inner
+            .top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok();
+        inner.bottom.store(t + 1, Ordering::Relaxed);
+        if won {
+            // We won the box; take ownership.
+            Some(unsafe { *Box::from_raw(boxed) })
+        } else {
+            // A thief won the CAS and owns the box; we must not free it.
+            None
+        }
+    }
+}
+
+impl<T> Default for Worker<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A thief handle that steals from the top of a work-stealing deque.
+///
+/// Cheap to clone; each clone can steal concurrently from a different thread.
+pub struct Stealer<T> {
+    inner: Arc<Inner<T>>,
+}
+
+// SAFETY: steal operations are lock-free and safe to invoke from many threads when `T: Send`.
+unsafe impl<T: Send> Send for Stealer<T> {}
+unsafe impl<T: Send> Sync for Stealer<T> {}
+
+impl<T> Clone for Stealer<T> {
+    fn clone(&self) -> Self {
+        Stealer {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Stealer<T> {
+    /// Attempt to steal a value from the top of the deque.
+    pub fn steal(&self) -> Steal<T> {
+        let inner = &*self.inner;
+        let t = inner.top.load(Ordering::Acquire);
+        // Orders this `top` load before the `bottom` load, matching the owner's pop fence.
+        fence(Ordering::SeqCst);
+        let b = inner.bottom.load(Ordering::Acquire);
+
+        if t >= b {
+            return Steal::Empty;
+        }
+
+        // Read the boxed-element pointer BEFORE the CAS: after a successful CAS the owner may
+        // refill the slot via a concurrent push. The atomic load here cannot race the owner.
+        let buf_ptr = inner.buffer.load(Ordering::Acquire);
+        // SAFETY: `t < b`, so the slot holds a live element pointer in the loaded buffer.
+        let boxed = unsafe { (*buf_ptr).read(t) };
+
+        if inner
+            .top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            // We won the box; take ownership.
+            Steal::Success(unsafe { *Box::from_raw(boxed) })
+        } else {
+            // Lost the race; the pointer we read belongs to whoever won the CAS. Don't free.
+            Steal::Retry
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::AtomicUsize;
+    use std::vec::Vec;
+
+    use super::*;
+
+    #[test]
+    fn push_pop_lifo() {
+        let w = Worker::new();
+        for i in 0..10 {
+            w.push(i);
+        }
+        // Owner pops in LIFO order.
+        for i in (0..10).rev() {
+            assert_eq!(w.pop(), Some(i));
+        }
+        assert_eq!(w.pop(), None);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn steal_fifo() {
+        let w = Worker::new();
+        let s = w.stealer();
+        for i in 0..10 {
+            w.push(i);
+        }
+        // Thieves take from the top in FIFO order.
+        for i in 0..10 {
+            assert_eq!(s.steal(), Steal::Success(i));
+        }
+        assert_eq!(s.steal(), Steal::Empty);
+    }
+
+    #[test]
+    fn grows_past_initial_capacity() {
+        // Start tiny (2 slots) to force several grows.
+        let w = Worker::<usize>::with_log_capacity(1);
+        let n = 10_000;
+        for i in 0..n {
+            w.push(i);
+        }
+        assert_eq!(w.len(), n);
+        let mut sum = 0usize;
+        while let Some(v) = w.pop() {
+            sum += v;
+        }
+        assert_eq!(sum, (0..n).sum());
+    }
+
+    #[test]
+    fn drops_remaining_elements_once() {
+        // A non-Copy payload that counts live instances detects double-free / leak.
+        struct Counted(StdArc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let live = StdArc::new(AtomicUsize::new(0));
+        {
+            let w = Worker::<Counted>::with_log_capacity(1);
+            for _ in 0..1000 {
+                live.fetch_add(1, Ordering::SeqCst);
+                w.push(Counted(StdArc::clone(&live)));
+            }
+            // Take some out (moved to us), drop the rest with the deque.
+            for _ in 0..400 {
+                drop(w.pop().unwrap());
+            }
+            assert_eq!(live.load(Ordering::SeqCst), 600);
+        }
+        // After the Worker is dropped, every element must be accounted for exactly once.
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    /// Drain one thief: steal until the owner is done and the deque is empty, recording
+    /// each stolen value exactly once. Extracted to keep nesting shallow.
+    fn run_thief(
+        s: &Stealer<usize>,
+        seen: &[AtomicUsize],
+        stolen_count: &AtomicUsize,
+        total: usize,
+    ) {
+        loop {
+            match s.steal() {
+                Steal::Success(v) => {
+                    seen[v].fetch_add(1, Ordering::SeqCst);
+                    stolen_count.fetch_add(1, Ordering::SeqCst);
+                }
+                Steal::Retry => {}
+                Steal::Empty if stolen_count.load(Ordering::SeqCst) >= total => break,
+                Steal::Empty => {}
+            }
+        }
+    }
+
+    /// Owner side: interleave pushes and pops, returning everything it popped itself.
+    fn run_owner(w: &Worker<usize>, total: usize) -> Vec<usize> {
+        let mut popped = Vec::new();
+        for i in 0..total {
+            w.push(i);
+            if i % 3 == 0 {
+                if let Some(v) = w.pop() {
+                    popped.push(v);
+                }
+            }
+        }
+        while let Some(v) = w.pop() {
+            popped.push(v);
+        }
+        popped
+    }
+
+    #[test]
+    fn concurrent_steal_no_loss_no_duplication() {
+        let w = Worker::<usize>::new();
+        let n: usize = 200_000;
+        let thieves = 4;
+
+        let seen: StdArc<Vec<AtomicUsize>> =
+            StdArc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+        let stolen_count = StdArc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..thieves {
+                let s = w.stealer();
+                let seen = StdArc::clone(&seen);
+                let stolen_count = StdArc::clone(&stolen_count);
+                scope.spawn(move || run_thief(&s, &seen, &stolen_count, n));
+            }
+
+            for v in run_owner(&w, n) {
+                seen[v].fetch_add(1, Ordering::SeqCst);
+                stolen_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Every value pushed must have been observed exactly once, by exactly one consumer.
+        for (v, slot) in seen.iter().enumerate() {
+            assert_eq!(
+                slot.load(Ordering::SeqCst),
+                1,
+                "value {v} not consumed exactly once"
+            );
+        }
+    }
+}
