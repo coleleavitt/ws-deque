@@ -101,7 +101,8 @@ A family of work-stealing structures, plus a scheduler that ties them together:
 | Module | Type | Contract / niche |
 | --- | --- | --- |
 | (root) | `Worker` / `Stealer` (Chase-Lev) | **exact-once**; LIFO or `new_fifo`; wraparound-safe; live buffer reclamation; cache-padded |
-| `bwos` | `BwosWorker` / `BwosStealer` | block-based work stealing (OSDI'23) — **~5.8× faster than crossbeam** on push/pop |
+| `bwos` | `BwosWorker` / `BwosStealer` | block-based work stealing (OSDI'23), **bounded** — **~5.8× faster than crossbeam** on push/pop |
+| `bwos::unbounded` | `UnboundedBwosWorker` / `…Stealer` | linked-block variant — unbounded capacity, closer-to-crossbeam throughput |
 | `inline` | `InlineWorker<T: Copy>` | allocation-free fast path — fence-light steal, no per-element box |
 | `idempotent` | `IdempotentWorker` (WS-MULT) | **≥1×** multiplicity; `put` is a plain store (no CAS/fence) |
 | `idempotent` | `WeakStealer` (WS-WMULT) | weak multiplicity; consumer path **fully fence-free, no RMW** |

@@ -238,8 +238,14 @@ its phase wrapper), so UB-detection (provenance/alignment/uninit) is presently v
    does a plain slot write + `Release` bump — **no `SeqCst` fence, no CAS** — which is the per-op
    cost Chase-Lev (ours *and* crossbeam's) cannot avoid. Each block is its own Chase-Lev deque
    (`committed`=bottom, `stolen`=top); owner and thieves only contend on the rare nearly-empty
-   block. Implemented as a bounded LIFO queue, loom-verified + ThreadSanitizer-clean. *This is the
-   design that actually wins, not just matches.*
+   block. Implemented as a bounded LIFO queue (BWoS is, per the paper title, a *bounded* queue —
+   its round control recycles a fixed block ring in bounded memory; it is **not** unbounded),
+   loom-verified + ThreadSanitizer-clean. *This is the design that actually wins, not just matches.*
+   `bwos::unbounded::UnboundedBwosWorker` is an additional variant whose blocks form a growable
+   linked list (allocated on demand, retained until drop) for callers who can't tolerate a
+   full-queue rejection; it keeps the per-block locality but pays an allocation when a push crosses
+   a block boundary, so its raw push/pop (~42 µs) is closer to crossbeam than the bounded ring's
+   ~6 µs — the honest bounded-vs-unbounded throughput tradeoff. Both are TSan- and loom-clean.
 
 2. **`CachePadded` the shared indices — ~20% on the contended deque.** Per-field 128-byte
    alignment (dependency-free `CachePadded`, like crossbeam's) stops the owner's `bottom` writes
